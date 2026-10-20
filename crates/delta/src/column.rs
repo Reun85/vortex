@@ -1,4 +1,4 @@
-use std::alloc::Layout;
+use std::{alloc::Layout, ops::Range};
 
 use crate::{
     blob_vec::{BlobVec, DropFn},
@@ -84,6 +84,11 @@ impl Column {
 
     pub fn set_changed(&mut self, row: usize, tick: Tick) {
         self.changed[row] = tick;
+    }
+
+    /// Stamps `changed` for a whole row range at once.
+    pub fn set_changed_range(&mut self, rows: Range<usize>, tick: Tick) {
+        self.changed[rows].fill(tick);
     }
 
     pub fn swap_remove_and_drop(&mut self, row: usize) {

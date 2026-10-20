@@ -61,7 +61,17 @@ impl World {
         &self.archetypes
     }
 
+    pub(crate) fn archetypes_mut(&mut self) -> &mut Archetypes {
+        &mut self.archetypes
+    }
+
     pub fn change_tick(&self) -> Tick {
+        self.change_tick
+    }
+
+    /// Advances the global change tick (once per system run) and returns it.
+    pub fn increment_change_tick(&mut self) -> Tick {
+        self.change_tick = Tick::new(self.change_tick.get().wrapping_add(1));
         self.change_tick
     }
 
