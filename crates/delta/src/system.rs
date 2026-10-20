@@ -309,6 +309,9 @@ unsafe impl<T: Default + Send + Sync + 'static> SystemParam for Local<'_, T> {
 /// A unit of work run by the schedule.
 pub trait System: 'static {
     fn name(&self) -> &str;
+    /// For recognizing a system's concrete type, e.g. to remove all the
+    /// systems of a script assembly that is being reloaded.
+    fn as_any(&self) -> &dyn std::any::Any;
     fn access(&self) -> &Access;
     /// Idempotent; resolves parameter state against the world.
     fn initialize(&mut self, world: &mut World);
@@ -392,6 +395,10 @@ impl<Marker: 'static, F: SystemParamFunction<Marker>> System
 {
     fn name(&self) -> &str {
         type_name::<F>()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn access(&self) -> &Access {

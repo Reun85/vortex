@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Text.Json.Serialization;
 
 namespace Delta;
 
@@ -16,6 +17,15 @@ public abstract class ScriptSystem
     protected virtual void OnInitialize(World world) { }
 
     protected abstract void OnRun(World world);
+
+    /// <summary>
+    /// Called when this script assembly is about to be unloaded for a reload.
+    /// Undo everything that keeps host objects pointing at script code, such
+    /// as static event subscriptions, or the old code cannot be unloaded.
+    /// </summary>
+    protected virtual void OnUnload() { }
+
+    internal void Unload() => OnUnload();
 
     internal void Run(World world)
     {
@@ -35,12 +45,20 @@ public abstract class ScriptSystem
 /// </summary>
 public abstract class Behaviour
 {
-    public Entity Entity { get; internal set; }
-    public World World { get; internal set; } = null!;
+    [JsonIgnore] public Entity Entity { get; internal set; }
+    [JsonIgnore] public World World { get; internal set; } = null!;
 
     public virtual void Update() { }
     public virtual void FixedUpdate() { }
     public virtual void LateUpdate() { }
+
+    /// <summary>
+    /// Called once, after this instance's state was saved, when its script
+    /// assembly is being reloaded. See <see cref="ScriptSystem"/>'s hook.
+    /// </summary>
+    protected virtual void OnUnload() { }
+
+    internal void Unload() => OnUnload();
 
     /// <summary>A component of this behaviour's entity. Writing through it marks it changed.</summary>
     protected ref T Get<T>() where T : unmanaged, IComponent => ref World.Get<T>(Entity);

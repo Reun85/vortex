@@ -29,6 +29,38 @@ impl Column {
         self.data.len()
     }
 
+    /// A copy of this column for a new element layout: every row is passed
+    /// through `convert(old, new)`, where `new` starts zeroed, and keeps its
+    /// ticks. The old column is untouched; drop it to run its drop function
+    /// on the old values.
+    ///
+    /// # Safety
+    /// `convert` must leave every new value valid for `drop`, and `drop`
+    /// must be valid for values of `layout`.
+    pub unsafe fn rebuilt(
+        &self,
+        layout: Layout,
+        drop: Option<DropFn>,
+        convert: &mut dyn FnMut(*const u8, *mut u8),
+    ) -> Column {
+        // SAFETY: forwarded contract.
+        let mut out = unsafe { Column::new(layout, drop) };
+        // One zeroed scratch value, reset before every row.
+        let mut scratch = vec![0u8; layout.size() + layout.align()];
+        let offset = scratch.as_ptr().align_offset(layout.align());
+        let new = scratch[offset..].as_mut_ptr();
+        for row in 0..self.len() {
+            // SAFETY: `new` has room for one aligned value of `layout`.
+            unsafe { std::ptr::write_bytes(new, 0, layout.size()) };
+            convert(self.get_ptr(row), new);
+            // SAFETY: `new` holds a valid value of the new layout.
+            unsafe { out.data.push(new) };
+            out.added.push(self.added[row]);
+            out.changed.push(TickCell::new(self.changed(row)));
+        }
+        out
+    }
+
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }

@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Runtime.Loader;
 using System.Text;
 
@@ -25,11 +27,25 @@ internal sealed class ScriptLoadContext(string path)
     }
 }
 
+/// <summary>Everything one loaded script assembly registered, so it can be undone.</summary>
+internal sealed class LoadedScript
+{
+    public uint Id;
+    /// <summary>Strong while loaded; cleared on unload so only the weak reference remains.</summary>
+    public ScriptLoadContext? Context;
+    public WeakReference ContextRef = null!;
+    public readonly List<uint> SystemIds = [];
+    public readonly List<Type> ComponentTypes = [];
+}
+
 internal static unsafe class Scripts
 {
     /// <summary>Script systems by the id the host assigned them.</summary>
     static readonly Dictionary<uint, ScriptSystem> Systems = new();
-    static readonly List<ScriptLoadContext> Contexts = new();
+    static readonly Dictionary<uint, LoadedScript> Loaded = new();
+    /// <summary>Behaviour classes by component id, to build instances on restore.</summary>
+    static readonly Dictionary<uint, Type> BehaviourTypes = new();
+    static uint nextId = 1;
 
     static bool IsComponentStruct(Type t) =>
         t.IsValueType && !t.IsEnum && !t.IsGenericTypeDefinition && typeof(IComponent).IsAssignableFrom(t);
@@ -44,7 +60,7 @@ internal static unsafe class Scripts
     static bool Overrides(Type t, string method) =>
         t.GetMethod(method, BindingFlags.Public | BindingFlags.Instance, Type.EmptyTypes)?.DeclaringType != typeof(Behaviour);
 
-    static uint Register(nint world, string name, Stage stage, int order, ScriptSystem system)
+    static void Register(nint world, LoadedScript script, string name, Stage stage, int order, ScriptSystem system)
     {
         var bytes = Encoding.UTF8.GetBytes(name);
         fixed (byte* p = bytes)
@@ -52,7 +68,7 @@ internal static unsafe class Scripts
             var desc = new SystemDescFfi { Name = p, NameLen = (nuint)bytes.Length, Stage = (uint)stage, Order = order };
             var id = Host.Check(world, Host.Api->RegisterSystem(world, &desc), $"registering system `{name}`");
             Systems[id] = system;
-            return id;
+            script.SystemIds.Add(id);
         }
     }
 
@@ -61,11 +77,13 @@ internal static unsafe class Scripts
     /// component structs, Behaviour classes, systems, and one dispatcher per
     /// Behaviour magic method. Returns how many systems were registered.
     /// </summary>
-    public static int Load(nint world, string path)
+    public static int Load(nint world, string path, out uint scriptId)
     {
         var context = new ScriptLoadContext(path);
+        var script = new LoadedScript { Id = nextId++, Context = context, ContextRef = new WeakReference(context) };
+        scriptId = script.Id;
         var assembly = context.LoadFromAssemblyPath(path);
-        Contexts.Add(context);
+        Loaded[script.Id] = script;
 
         Type[] types;
         try { types = assembly.GetTypes(); }
@@ -73,23 +91,29 @@ internal static unsafe class Scripts
 
         // Deterministic registration order, so component ids are stable run to run.
         foreach (var t in types.Where(IsComponentStruct).OrderBy(ComponentRegistry.NameOf, StringComparer.Ordinal))
+        {
             ComponentRegistry.RegisterStruct(world, t);
+            script.ComponentTypes.Add(t);
+        }
         foreach (var t in types.Where(IsBehaviour).OrderBy(ComponentRegistry.NameOf, StringComparer.Ordinal))
-            ComponentRegistry.RegisterBehaviour(world, t);
+        {
+            var id = ComponentRegistry.RegisterBehaviour(world, t);
+            BehaviourTypes[id] = t;
+            script.ComponentTypes.Add(t);
+        }
 
         var count = 0;
         foreach (var t in types.Where(IsScriptSystem).OrderBy(t => t.FullName, StringComparer.Ordinal))
         {
             var attr = t.GetCustomAttribute<SystemAttribute>();
             var system = (ScriptSystem)Activator.CreateInstance(t)!;
-            Register(world, t.FullName ?? t.Name, attr?.Stage ?? Stage.Update, attr?.Order ?? 0, system);
+            Register(world, script, t.FullName ?? t.Name, attr?.Stage ?? Stage.Update, attr?.Order ?? 0, system);
             count++;
         }
 
         foreach (var t in types.Where(IsBehaviour).OrderBy(ComponentRegistry.NameOf, StringComparer.Ordinal))
         {
-            var component = (uint)typeof(ComponentType<>).MakeGenericType(t)
-                .GetField("Value", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!;
+            var component = ComponentIdOf(t);
             var order = t.GetCustomAttribute<ExecutionOrderAttribute>()?.Order ?? 0;
             foreach (var (name, method, stage) in new[]
             {
@@ -99,12 +123,65 @@ internal static unsafe class Scripts
             })
             {
                 if (!Overrides(t, name)) continue;
-                Register(world, $"{t.FullName}.{name}", stage, order, new BehaviourSystem(component, method));
+                Register(world, script, $"{t.FullName}.{name}", stage, order, new BehaviourSystem(component, method));
                 count++;
             }
         }
         return count;
     }
 
+    static uint ComponentIdOf(Type t) =>
+        (uint)typeof(ComponentType<>).MakeGenericType(t)
+            .GetField("Value", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!;
+
     public static void Run(uint id, nint world) => Systems[id].Run(World.For(world));
+
+    /// <summary>
+    /// Undoes a load: lets systems clean up, drops every table entry that
+    /// refers to the assembly's types, and unloads its context. Kept out of
+    /// line so no local here keeps the context alive afterwards.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static void Unload(uint scriptId)
+    {
+        if (!Loaded.TryGetValue(scriptId, out var script) || script.Context is null) return;
+        foreach (var id in script.SystemIds)
+        {
+            try { Systems[id].Unload(); }
+            catch (Exception e) { Bridge.Warn($"OnUnload of a system threw: {e.Message}"); }
+            Systems.Remove(id);
+        }
+        script.SystemIds.Clear();
+        foreach (var t in script.ComponentTypes)
+        {
+            var component = ComponentIdOf(t);
+            BehaviourTypes.Remove(component);
+            ComponentRegistry.Forget(t);
+        }
+        script.ComponentTypes.Clear();
+        var context = script.Context;
+        script.Context = null;
+        ComponentRegistry.ForgetAssembliesOf(context);
+        context.Unload();
+    }
+
+    /// <summary>
+    /// Collects garbage and reports whether the context is still alive. A
+    /// context that survives has something still pointing at its code.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static bool IsAlive(uint scriptId)
+    {
+        if (!Loaded.TryGetValue(scriptId, out var script)) return false;
+        for (var i = 0; i < 10 && script.ContextRef.IsAlive; i++)
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+        }
+        return script.ContextRef.IsAlive;
+    }
+
+    public static Behaviour? Behaviour(nint handle) => GCHandle.FromIntPtr(handle).Target as Behaviour;
+
+    public static bool TryBehaviourType(uint component, out Type type) => BehaviourTypes.TryGetValue(component, out type!);
 }

@@ -119,15 +119,18 @@ pub struct HostApi {
 }
 
 /// C# -> Rust, filled in by `Bridge.Initialize`. Optional so an
-/// uninitialized table is representable.
+/// uninitialized table is representable. Field order is the contract.
 #[repr(C)]
 pub struct ScriptApi {
     pub version: u32,
     pub size: u32,
-    /// Loads a script assembly, registers what it declares, and returns the
-    /// number of systems registered, or a negative value on error.
-    pub load_assembly:
-        Option<unsafe extern "C" fn(*mut World, *const u8, usize) -> i32>,
+    /// Loads a script assembly into its own collectible load context,
+    /// registers what it declares, writes an assembly handle to the last
+    /// argument, and returns the number of systems registered, or a negative
+    /// value on error (see `last_error`).
+    pub load_assembly: Option<
+        unsafe extern "C" fn(*mut World, *const u8, usize, *mut u32) -> i32,
+    >,
     pub run_system: Option<unsafe extern "C" fn(u32, *mut World)>,
     pub free_handle: Option<unsafe extern "C" fn(u64)>,
     /// Number of live `GCHandle`s held for managed components (for tests).
@@ -135,4 +138,22 @@ pub struct ScriptApi {
     /// The message of the last managed failure, copied into the buffer;
     /// returns its full length.
     pub last_error: Option<unsafe extern "C" fn(*mut u8, usize) -> usize>,
+    /// Tears down an assembly's systems and unloads its load context. Every
+    /// handle to its objects must have been freed first.
+    pub unload_assembly: Option<unsafe extern "C" fn(u32)>,
+    /// Collects garbage and reports whether the assembly's load context is
+    /// still alive (nonzero): a zero means the old code is really gone.
+    pub assembly_alive: Option<unsafe extern "C" fn(u32) -> u8>,
+    /// Serializes a behaviour object for a reload. Copies up to `cap` bytes
+    /// and returns the full length, or `usize::MAX` on failure. The call
+    /// that actually delivers the bytes (`cap` large enough) also runs the
+    /// object's `OnUnload`; a size query with `cap` 0 does not.
+    pub serialize_behaviour:
+        Option<unsafe extern "C" fn(u64, *mut u8, usize) -> usize>,
+    /// Creates a behaviour of a component's (new) class from serialized
+    /// state and returns its handle, or 0 on failure.
+    pub deserialize_behaviour:
+        Option<unsafe extern "C" fn(u32, *const u8, usize) -> u64>,
+    /// Drains the warnings the managed side collected (newline separated).
+    pub take_warnings: Option<unsafe extern "C" fn(*mut u8, usize) -> usize>,
 }

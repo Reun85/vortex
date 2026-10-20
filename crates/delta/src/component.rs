@@ -172,6 +172,17 @@ impl Components {
         self.by_name.get(name).copied()
     }
 
+    /// Mutable access to a component's description, for hosts that redefine
+    /// a script component on hot reload.
+    ///
+    /// # Safety
+    /// If the layout, kind or drop function change, the caller must rebuild
+    /// every column of this component (see `World::rebuild_columns`) before
+    /// the world is used again.
+    pub unsafe fn info_mut(&mut self, id: ComponentId) -> &mut ComponentInfo {
+        &mut self.infos[id.index()]
+    }
+
     pub fn info(&self, id: ComponentId) -> &ComponentInfo {
         &self.infos[id.index()]
     }

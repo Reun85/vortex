@@ -114,15 +114,20 @@ internal unsafe struct HostApi
     public delegate* unmanaged<nint, byte*, nuint, nuint> LastError;
 }
 
-/// <summary>C# -> Rust, filled in by <see cref="Bridge.Initialize"/>.</summary>
+/// <summary>C# -> Rust, filled in by <see cref="Bridge.Initialize"/>. Field order is the contract.</summary>
 [StructLayout(LayoutKind.Sequential)]
 internal unsafe struct ScriptApi
 {
     public uint Version;
     public uint Size;
-    public delegate* unmanaged<nint, byte*, nuint, int> LoadAssembly;
+    public delegate* unmanaged<nint, byte*, nuint, uint*, int> LoadAssembly;
     public delegate* unmanaged<uint, nint, void> RunSystem;
     public delegate* unmanaged<ulong, void> FreeHandle;
     public delegate* unmanaged<ulong> LiveHandles;
     public delegate* unmanaged<byte*, nuint, nuint> LastError;
+    public delegate* unmanaged<uint, void> UnloadAssembly;
+    public delegate* unmanaged<uint, byte> AssemblyAlive;
+    public delegate* unmanaged<ulong, byte*, nuint, nuint> SerializeBehaviour;
+    public delegate* unmanaged<uint, byte*, nuint, ulong> DeserializeBehaviour;
+    public delegate* unmanaged<byte*, nuint, nuint> TakeWarnings;
 }

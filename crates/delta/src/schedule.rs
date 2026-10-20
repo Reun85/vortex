@@ -72,6 +72,21 @@ impl Schedule {
         self
     }
 
+    /// Removes every system for which `remove` returns true, in all stages.
+    /// Returns how many were removed.
+    pub fn remove_systems(
+        &mut self,
+        mut remove: impl FnMut(&dyn System) -> bool,
+    ) -> usize {
+        let mut removed = 0;
+        for stage in &mut self.stages {
+            let before = stage.len();
+            stage.retain(|s| !remove(s.as_ref()));
+            removed += before - stage.len();
+        }
+        removed
+    }
+
     /// How many times `FixedUpdate` runs per [`run`](Self::run).
     pub fn set_fixed_steps(&mut self, steps: u32) -> &mut Self {
         self.fixed_steps = steps;

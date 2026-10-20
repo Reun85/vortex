@@ -10,6 +10,12 @@ pub mod ffi;
 pub mod host;
 mod script;
 
-pub use bridge::PendingSystem;
+pub use bridge::{PendingSystem, RemovedRecord};
 pub use host::{DotnetHost, HostError};
-pub use script::{ScriptError, ScriptHost, ScriptSystem};
+pub use script::{
+    ReloadReport,
+    ScriptAssembly,
+    ScriptError,
+    ScriptHost,
+    ScriptSystem,
+};

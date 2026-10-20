@@ -83,10 +83,11 @@ fn csharp_scripts_drive_the_world() {
     .expect("start scripting");
 
     // --- loading registers components, reflection data and systems -------
-    let systems = host
+    let assembly = host
         .load_assembly(&mut world, &movers_dir.join("Movers.dll"))
         .expect("load Movers");
-    let mut names: Vec<_> = systems.iter().map(|s| s.name.as_str()).collect();
+    let mut names: Vec<_> =
+        assembly.systems.iter().map(|s| s.name.as_str()).collect();
     names.sort_unstable();
     assert_eq!(
         names,
@@ -150,7 +151,7 @@ fn csharp_scripts_drive_the_world() {
     }
 
     let mut schedule = Schedule::new();
-    host.install(&mut schedule, systems);
+    host.install(&mut schedule, &assembly);
 
     let pos_id = world.components().id_by_name("Movers.Position").unwrap();
     let before = world.change_tick();

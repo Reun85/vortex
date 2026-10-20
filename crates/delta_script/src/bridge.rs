@@ -34,6 +34,9 @@ pub(crate) static FREE_HANDLE: OnceLock<unsafe extern "C" fn(u64)> =
 pub(crate) unsafe fn drop_gc_handle(p: *mut u8) {
     // SAFETY: per contract.
     let handle = unsafe { p.cast::<u64>().read_unaligned() };
+    if handle == 0 {
+        return; // already freed, e.g. by a reload that saved this value
+    }
     if let Some(free) = FREE_HANDLE.get() {
         // SAFETY: the callback was handed out by the script runtime.
         unsafe { free(handle) };
@@ -60,6 +63,23 @@ pub(crate) struct ScriptState {
     pub pending_systems: Vec<PendingSystem>,
     pub next_system_id: u32,
     pub last_error: String,
+    /// While a hot reload loads the new assembly, registering an existing
+    /// component with a different definition redefines it instead of failing.
+    pub reloading: bool,
+    /// Every script component the current load registered or confirmed.
+    pub load_components: Vec<ComponentId>,
+    /// Behaviour state saved from entities whose class is gone (or whose
+    /// reload failed). Restored if the class comes back.
+    pub removed_records: Vec<RemovedRecord>,
+}
+
+/// Saved state of a behaviour that currently has no class to live in.
+#[derive(Clone, Debug)]
+pub struct RemovedRecord {
+    /// The behaviour class, as the stable component name.
+    pub class: String,
+    pub entity: Entity,
+    pub bytes: Vec<u8>,
 }
 
 // SAFETY: scripts run on the thread that owns the world; the raw pointer is
@@ -76,6 +96,9 @@ impl ScriptState {
             pending_systems: Vec::new(),
             next_system_id: 0,
             last_error: String::new(),
+            reloading: false,
+            load_components: Vec::new(),
+            removed_records: Vec::new(),
         }
     }
 }
@@ -146,11 +169,19 @@ unsafe fn register_component_impl(
         ));
     }
 
+    let reloading = state(world).reloading;
+
     if desc.kind == KIND_STRUCT {
-        return world
-            .reflection_mut()
-            .register_dynamic(name, desc.size, desc.align, reflect_fields)
-            .map(|id| id.index() as u32);
+        let registry = world.reflection_mut();
+        return if reloading {
+            Ok(registry
+                .replace_dynamic(name, desc.size, desc.align, reflect_fields)
+                .index() as u32)
+        } else {
+            registry
+                .register_dynamic(name, desc.size, desc.align, reflect_fields)
+                .map(|id| id.index() as u32)
+        };
     }
 
     let layout = Layout::from_size_align(desc.size, desc.align)
@@ -169,21 +200,18 @@ unsafe fn register_component_impl(
         other => return Err(format!("unknown component kind {other}")),
     };
 
-    if let Some(existing) = world.components().id_by_name(name) {
-        let info = world.components().info(existing);
-        return if info.layout == layout && info.kind == kind {
-            Ok(existing.index() as u32)
-        } else {
-            Err(format!(
-                "component `{name}` is already registered with a different \
-                 layout (migration is not implemented yet)"
-            ))
-        };
-    }
-
     let reflect = if managed {
         None
+    } else if reloading {
+        Some(world.reflection_mut().replace_dynamic(
+            name,
+            desc.size,
+            desc.align,
+            reflect_fields,
+        ))
     } else {
+        // An existing component with a different shape is rejected below;
+        // registering the shape first keeps that error specific.
         Some(world.reflection_mut().register_dynamic(
             name,
             desc.size,
@@ -191,16 +219,46 @@ unsafe fn register_component_impl(
             reflect_fields,
         )?)
     };
-    let id = world.components_mut().register_raw(ComponentInfo {
-        name: name.into(),
-        layout,
-        drop: managed.then_some(drop_gc_handle as delta::blob_vec::DropFn),
-        clone: None,
-        kind,
-        storage: Storage::Table,
-        hooks: delta::ComponentHooks::default(),
-        reflect,
-    });
+
+    let id = if let Some(existing) = world.components().id_by_name(name) {
+        let info = world.components().info(existing);
+        if info.layout != layout || info.kind != kind {
+            if !reloading {
+                return Err(format!(
+                    "component `{name}` is already registered with a different \
+                     layout (only a reload may redefine it)"
+                ));
+            }
+            // SAFETY: the reload migrates every column of this component
+            // before the world runs again (see `ScriptHost::reload`).
+            let info = unsafe { world.components_mut().info_mut(existing) };
+            info.layout = layout;
+            info.kind = kind;
+            info.drop = None;
+        }
+        if reloading {
+            // SAFETY: only the reflection id changes here; the layout case
+            // above is the one that needs migration.
+            unsafe { world.components_mut().info_mut(existing) }.reflect =
+                reflect;
+        }
+        existing
+    } else {
+        world.components_mut().register_raw(ComponentInfo {
+            name: name.into(),
+            layout,
+            drop: managed.then_some(drop_gc_handle as delta::blob_vec::DropFn),
+            clone: None,
+            kind,
+            storage: Storage::Table,
+            hooks: delta::ComponentHooks::default(),
+            reflect,
+        })
+    };
+    let st = state(world);
+    if !st.load_components.contains(&id) {
+        st.load_components.push(id);
+    }
     Ok(id.index() as u32)
 }
 

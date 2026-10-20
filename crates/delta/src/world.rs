@@ -546,6 +546,34 @@ impl World {
         );
     }
 
+    /// Rebuilds every column of `c` to match its current [`ComponentInfo`],
+    /// converting each value with `convert(old, new)`. Used when a script
+    /// redefines a component on hot reload: update the info first, then call
+    /// this. Entities keep their rows, ticks and archetypes.
+    ///
+    /// # Safety
+    /// See [`Column::rebuilt`].
+    pub unsafe fn rebuild_columns(
+        &mut self,
+        c: ComponentId,
+        convert: &mut dyn FnMut(*const u8, *mut u8),
+    ) {
+        let (layout, drop) = {
+            let info = self.components.info(c);
+            (info.layout, info.drop)
+        };
+        for arch in self.archetypes.iter_mut() {
+            let Some(i) = arch.column_index(c) else {
+                continue;
+            };
+            let columns = arch.columns_mut();
+            // SAFETY: forwarded contract.
+            let new = unsafe { columns[i].rebuilt(layout, drop, convert) };
+            // Dropping the old column drops its values with the old drop fn.
+            columns[i] = new;
+        }
+    }
+
     /// Asserts every storage invariant; used by tests.
     #[cfg(test)]
     pub(crate) fn validate(&self) {
@@ -826,6 +854,68 @@ mod tests {
         assert_eq!(changed_since(&w, last_run), 1);
         w.get_mut::<A>(e).unwrap().bypass_change_detection().0 += 1;
         assert_eq!(w.get::<A>(e), Some(&A(2)));
+    }
+
+    #[test]
+    fn rebuild_columns_converts_values_and_keeps_rows_and_ticks() {
+        use std::alloc::Layout;
+
+        use crate::{
+            component::{ComponentInfo, Kind},
+            hooks::ComponentHooks,
+        };
+
+        let mut w = World::new();
+        let c = w.components_mut().register_raw(ComponentInfo {
+            name: "Script::Thing".into(),
+            layout: Layout::new::<u32>(),
+            drop: None,
+            clone: None,
+            kind: Kind::ScriptUnmanaged,
+            storage: Storage::Table,
+            hooks: ComponentHooks::default(),
+            reflect: None,
+        });
+        // Entities across two archetypes (with and without `A`).
+        let ents: Vec<_> = (0..4).map(|_| w.spawn()).collect();
+        for (i, &e) in ents.iter().enumerate() {
+            let v = i as u32 + 10;
+            // SAFETY: a valid u32 for a u32-layout component.
+            unsafe { w.insert_by_id(e, c, (&raw const v).cast()) }.unwrap();
+            if i % 2 == 0 {
+                w.insert(e, A(i as u32)).unwrap();
+            }
+        }
+        w.increment_change_tick();
+        let tick_before = w.change_tick();
+
+        // Redefine the component as a u64 and convert.
+        // SAFETY: the columns are rebuilt right below.
+        unsafe {
+            let info = w.components_mut().info_mut(c);
+            info.layout = Layout::new::<u64>();
+            w.rebuild_columns(c, &mut |old, new| {
+                let v = old.cast::<u32>().read();
+                new.cast::<u64>().write(u64::from(v) * 1000);
+            });
+        }
+        for (i, &e) in ents.iter().enumerate() {
+            let p = w.get_by_id(e, c).unwrap();
+            // SAFETY: the column now holds u64 values.
+            assert_eq!(
+                unsafe { p.cast::<u64>().read() },
+                (i as u64 + 10) * 1000
+            );
+            // Rows, other components and add/change ticks are untouched.
+            let loc = w.location(e).unwrap();
+            let col = w.archetypes().get(loc.archetype).column(c).unwrap();
+            assert_eq!(col.added(loc.row).get(), 1);
+            assert!(col.changed(loc.row).get() < tick_before.get());
+            if i % 2 == 0 {
+                assert_eq!(w.get::<A>(e), Some(&A(i as u32)));
+            }
+        }
+        w.validate();
     }
 
     #[test]

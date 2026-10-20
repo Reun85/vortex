@@ -126,7 +126,25 @@ internal static unsafe class ComponentRegistry
         return id;
     }
 
-    static void SetId(Type t, uint id) =>
+    /// <summary>
+    /// Drops the nested-struct entries of a load context's assemblies; those
+    /// are cached by <see cref="Type"/> and would keep the context alive.
+    /// </summary>
+    public static void ForgetAssembliesOf(System.Runtime.Loader.AssemblyLoadContext context)
+    {
+        foreach (var assembly in context.Assemblies.ToArray())
+            foreach (var type in StructIds.Keys.Where(k => k.Assembly == assembly).ToArray())
+                StructIds.Remove(type);
+    }
+
+    /// <summary>Drops every reference this registry holds to a script type.</summary>
+    public static void Forget(Type t)
+    {
+        StructIds.Remove(t);
+        SetId(t, Native.Invalid);
+    }
+
+    public static void SetId(Type t, uint id) =>
         typeof(ComponentType<>).MakeGenericType(t)
             .GetField("Value", BindingFlags.Static | BindingFlags.NonPublic)!
             .SetValue(null, id);
