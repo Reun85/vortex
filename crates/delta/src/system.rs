@@ -6,6 +6,7 @@ use std::{
 
 use crate::{
     component::ComponentId,
+    observer::EventId,
     query::QueryDesc,
     tick::Tick,
     world::{World, WorldCell},
@@ -20,6 +21,7 @@ pub struct Access {
     writes: Vec<ComponentId>,
     resource_reads: Vec<TypeId>,
     resource_writes: Vec<TypeId>,
+    trigger: Option<EventId>,
 }
 
 impl Access {
@@ -51,6 +53,15 @@ impl Access {
              and accessed by another in the same system"
         );
         self.writes.push(c);
+    }
+
+    /// The event type this system observes, if it has a `Trigger` parameter.
+    pub fn trigger_event(&self) -> Option<EventId> {
+        self.trigger
+    }
+
+    pub fn set_trigger_event(&mut self, event: EventId) {
+        self.trigger = Some(event);
     }
 
     pub fn add_query(&mut self, desc: &QueryDesc) {

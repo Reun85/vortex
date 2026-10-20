@@ -79,6 +79,7 @@ impl Schedule {
                 self.run_stage(stage, world);
             }
         }
+        world.update_messages();
         if let Some(now) = world.check_change_ticks() {
             for system in self.stages.iter_mut().flatten() {
                 system.check_change_tick(now);

@@ -3,17 +3,27 @@ use std::{
     collections::HashMap,
     fmt,
     marker::PhantomData,
-    mem::ManuallyDrop,
+    mem::{self, ManuallyDrop},
     ptr,
 };
 
 use crate::{
     archetype::{ArchetypeId, Archetypes},
     change::Mut,
+    commands::CommandQueue,
     component::{ComponentId, Components, Storage},
     entity::{Entities, Entity, EntityLocation},
+    hooks::{DeferredWorld, Hook, HooksBuilder},
+    observer::{Events, ObserverIndex, TriggerFrame},
     tick::{CHECK_TICK_THRESHOLD, Tick},
 };
+
+/// Swaps the buffers of one message type; see `World::update_messages`.
+pub(crate) type MessageUpdater = (TypeId, fn(&mut World));
+
+/// How many rounds of hook/observer-generated commands one sync point may
+/// run before the world assumes they feed each other forever.
+pub const MAX_DEFERRED_ROUNDS: u32 = 100;
 
 /// The operation targeted an entity that is not alive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,13 +39,25 @@ impl std::error::Error for DeadEntity {}
 
 /// Owns the registry, entity allocator and archetype storage.
 pub struct World {
-    components: Components,
-    entities: Entities,
-    archetypes: Archetypes,
-    change_tick: Tick,
-    resources: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
-    last_check_tick: Tick,
-    archetype_moves: u64,
+    pub(crate) components: Components,
+    pub(crate) entities: Entities,
+    pub(crate) archetypes: Archetypes,
+    pub(crate) change_tick: Tick,
+    pub(crate) resources: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    pub(crate) last_check_tick: Tick,
+    pub(crate) archetype_moves: u64,
+    /// Work produced by hooks and observers, applied before the sync point
+    /// ends. See [`flush_deferred`](Self::flush_deferred).
+    pub(crate) deferred: CommandQueue,
+    /// Nesting of command application; deferred work waits while non-zero.
+    pub(crate) apply_depth: u32,
+    /// Non-zero while observers of an event are running.
+    pub(crate) dispatching: u32,
+    pub(crate) trigger_stack: Vec<TriggerFrame>,
+    pub(crate) events: Events,
+    pub(crate) observers: ObserverIndex,
+    pub(crate) observer_hooks_registered: bool,
+    pub(crate) message_updaters: Vec<MessageUpdater>,
 }
 
 impl Default for World {
@@ -56,6 +78,14 @@ impl World {
             resources: HashMap::new(),
             last_check_tick: Tick::new(1),
             archetype_moves: 0,
+            deferred: CommandQueue::default(),
+            apply_depth: 0,
+            dispatching: 0,
+            trigger_stack: Vec::new(),
+            events: Events::default(),
+            observers: ObserverIndex::default(),
+            observer_hooks_registered: false,
+            message_updaters: Vec::new(),
         }
     }
 
@@ -117,6 +147,68 @@ impl World {
         self.components.register::<T>()
     }
 
+    /// Registers lifecycle hooks for `T`:
+    /// `world.register_hooks::<T>().on_add(..).on_remove(..)`.
+    pub fn register_hooks<T: Send + Sync + 'static>(
+        &mut self,
+    ) -> HooksBuilder<'_> {
+        let id = self.components.register::<T>();
+        HooksBuilder {
+            hooks: self.components.hooks_mut(id),
+        }
+    }
+
+    fn run_hook(&mut self, hook: Option<Hook>, e: Entity) {
+        if let Some(hook) = hook {
+            hook(DeferredWorld { world: self }, e);
+        }
+    }
+
+    /// Fires `on_replace` then `on_remove` for each of `ids`, while the
+    /// values are still in place.
+    fn fire_remove_hooks(&mut self, e: Entity, ids: &[ComponentId]) {
+        for &c in ids {
+            let hooks = self.components.hooks(c);
+            self.run_hook(hooks.on_replace, e);
+            self.run_hook(hooks.on_remove, e);
+        }
+    }
+
+    /// The deferred buffer together with the allocator, for `Commands`.
+    pub(crate) fn deferred_parts(&mut self) -> (&mut CommandQueue, &Entities) {
+        (&mut self.deferred, &self.entities)
+    }
+
+    /// Applies everything hooks and observers queued, including what that
+    /// work queues in turn, until nothing is left.
+    ///
+    /// # Panics
+    /// After [`MAX_DEFERRED_ROUNDS`] rounds, which means hooks or observers
+    /// keep triggering each other.
+    pub fn flush_deferred(&mut self) {
+        self.apply_depth += 1;
+        let mut rounds = 0;
+        while !self.deferred.is_empty() {
+            rounds += 1;
+            assert!(
+                rounds <= MAX_DEFERRED_ROUNDS,
+                "deferred command recursion limit exceeded: hooks or \
+                 observers keep queueing work for each other"
+            );
+            let mut queue = mem::take(&mut self.deferred);
+            queue.apply_inner(self);
+        }
+        self.apply_depth -= 1;
+    }
+
+    /// Ends a structural operation: unless a larger application is in
+    /// progress, runs the work hooks queued.
+    pub(crate) fn finish_op(&mut self) {
+        if self.apply_depth == 0 {
+            self.flush_deferred();
+        }
+    }
+
     pub fn is_alive(&self, e: Entity) -> bool {
         self.entities.is_alive(e)
     }
@@ -147,10 +239,16 @@ impl World {
         e
     }
 
-    /// Despawns `e`, dropping all of its components.
+    /// Despawns `e`, dropping all of its components. Observers that were
+    /// targeting it are despawned too.
     pub fn despawn(&mut self, e: Entity) -> Result<(), DeadEntity> {
         self.flush_entities();
-        let loc = self.entities.free(e).ok_or(DeadEntity(e))?;
+        let loc = self.entities.location(e).ok_or(DeadEntity(e))?;
+        if self.components.any_hooks() {
+            let ids = self.archetypes.get(loc.archetype).components().to_vec();
+            self.fire_remove_hooks(e, &ids);
+        }
+        self.entities.free(e);
         let arch = self.archetypes.get_mut(loc.archetype);
         for col in arch.columns_mut() {
             col.swap_remove_and_drop(loc.row);
@@ -158,6 +256,10 @@ impl World {
         if let Some(moved) = arch.swap_remove_entity(loc.row) {
             self.entities.set_location(moved, loc);
         }
+        for observer in self.observers.watchers(e) {
+            self.deferred.despawn(observer);
+        }
+        self.finish_op();
         Ok(())
     }
 
@@ -176,30 +278,14 @@ impl World {
         c: ComponentId,
         src: *const u8,
     ) -> Result<(), DeadEntity> {
-        assert!(
-            self.components.info(c).storage == Storage::Table,
-            "sparse-set storage is not implemented yet"
-        );
-        self.flush_entities();
-        let loc = self.entities.location(e).ok_or(DeadEntity(e))?;
-        let tick = self.change_tick;
-        let arch = self.archetypes.get_mut(loc.archetype);
-        if let Some(col) = arch.column_mut(c) {
-            // SAFETY: src is valid per the contract.
-            unsafe { col.replace(loc.row, src, tick) };
-            return Ok(());
-        }
-        let to = self
-            .archetypes
-            .with_added(loc.archetype, c, &self.components);
-        // SAFETY: src is valid per the contract.
-        unsafe { self.move_entity(e, loc, to, &[(c, src)]) };
-        Ok(())
+        // SAFETY: forwarded contract.
+        unsafe { self.insert_many_by_id(e, &[(c, src)]) }
     }
 
     /// Adds several components to `e` at once, overwriting any it already
     /// has. The entity changes archetype at most once, straight to the final
-    /// one, without passing through intermediate archetypes.
+    /// one, without passing through intermediate archetypes. Hooks run after
+    /// every value is in place.
     ///
     /// # Safety
     /// Every `src` must satisfy [`insert_by_id`](Self::insert_by_id)'s
@@ -221,6 +307,22 @@ impl World {
         }
         self.flush_entities();
         let loc = self.entities.location(e).ok_or(DeadEntity(e))?;
+        let hooks_on = self.components.any_hooks();
+
+        // Overwritten values announce their replacement while still intact.
+        if hooks_on {
+            let arch = self.archetypes.get(loc.archetype);
+            let replaced: Vec<_> = items
+                .iter()
+                .map(|&(c, _)| c)
+                .filter(|&c| arch.contains(c))
+                .collect();
+            for c in replaced {
+                let hook = self.components.hooks(c).on_replace;
+                self.run_hook(hook, e);
+            }
+        }
+
         let tick = self.change_tick;
         let arch = self.archetypes.get_mut(loc.archetype);
         let mut added = Vec::new();
@@ -231,22 +333,40 @@ impl World {
                 None => added.push((c, src)),
             }
         }
-        let to = match added[..] {
-            [] => return Ok(()),
+        match added[..] {
+            [] => {}
             [(c, _)] => {
-                self.archetypes
-                    .with_added(loc.archetype, c, &self.components)
+                let to = self.archetypes.with_added(
+                    loc.archetype,
+                    c,
+                    &self.components,
+                );
+                // SAFETY: `added` holds exactly the destination's additions.
+                unsafe { self.move_entity(e, loc, to, &added) };
             }
             _ => {
                 let mut comps =
                     self.archetypes.get(loc.archetype).components().to_vec();
                 comps.extend(added.iter().map(|&(c, _)| c));
                 comps.sort_unstable();
-                self.archetypes.get_or_create(&comps, &self.components)
+                let to =
+                    self.archetypes.get_or_create(&comps, &self.components);
+                // SAFETY: `added` holds exactly the destination's additions.
+                unsafe { self.move_entity(e, loc, to, &added) };
             }
-        };
-        // SAFETY: `added` holds exactly the destination's new components.
-        unsafe { self.move_entity(e, loc, to, &added) };
+        }
+
+        if hooks_on {
+            for &(c, _) in &added {
+                let hook = self.components.hooks(c).on_add;
+                self.run_hook(hook, e);
+            }
+            for &(c, _) in items {
+                let hook = self.components.hooks(c).on_insert;
+                self.run_hook(hook, e);
+            }
+        }
+        self.finish_op();
         Ok(())
     }
 
@@ -262,11 +382,15 @@ impl World {
         if !self.archetypes.get(loc.archetype).contains(c) {
             return Ok(false);
         }
+        if self.components.any_hooks() {
+            self.fire_remove_hooks(e, &[c]);
+        }
         let to =
             self.archetypes
                 .with_removed(loc.archetype, c, &self.components);
         // SAFETY: no extra component is added.
         unsafe { self.move_entity(e, loc, to, &[]) };
+        self.finish_op();
         Ok(true)
     }
 
@@ -498,6 +622,14 @@ impl<'w> WorldCell<'w> {
     pub(crate) unsafe fn archetypes_mut(self) -> &'w mut Archetypes {
         // SAFETY: field projection without creating `&mut World`.
         unsafe { &mut *ptr::addr_of_mut!((*self.world).archetypes) }
+    }
+
+    /// # Safety
+    /// Nobody mutates the trigger stack concurrently.
+    pub(crate) unsafe fn current_trigger(self) -> Option<&'w TriggerFrame> {
+        // SAFETY: field projection without creating `&World`.
+        let stack = unsafe { &*ptr::addr_of!((*self.world).trigger_stack) };
+        stack.last()
     }
 
     pub fn change_tick(self) -> Tick {

@@ -1,6 +1,6 @@
 use std::{alloc::Layout, any::TypeId, collections::HashMap, ptr};
 
-use crate::blob_vec::DropFn;
+use crate::{blob_vec::DropFn, hooks::ComponentHooks};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ComponentId(u32);
@@ -41,6 +41,7 @@ pub struct ComponentInfo {
     pub clone: Option<CloneFn>,
     pub kind: Kind,
     pub storage: Storage,
+    pub hooks: ComponentHooks,
 }
 
 #[derive(Default)]
@@ -48,6 +49,7 @@ pub struct Components {
     infos: Vec<ComponentInfo>,
     by_name: HashMap<Box<str>, ComponentId>,
     by_type: HashMap<TypeId, ComponentId>,
+    any_hooks: bool,
 }
 
 impl Components {
@@ -94,6 +96,7 @@ impl Components {
                 Kind::Native
             },
             storage: Storage::Table,
+            hooks: ComponentHooks::default(),
         });
         self.by_type.insert(TypeId::of::<T>(), id);
         id
@@ -106,6 +109,21 @@ impl Components {
         let id = self.register::<T>();
         self.infos[id.index()].clone = Some(clone_fn::<T>);
         id
+    }
+
+    /// Whether any component has a hook; lets structural operations skip all
+    /// hook bookkeeping in the common case.
+    pub fn any_hooks(&self) -> bool {
+        self.any_hooks
+    }
+
+    pub fn hooks(&self, id: ComponentId) -> ComponentHooks {
+        self.infos[id.index()].hooks
+    }
+
+    pub fn hooks_mut(&mut self, id: ComponentId) -> &mut ComponentHooks {
+        self.any_hooks = true;
+        &mut self.infos[id.index()].hooks
     }
 
     pub fn id_of<T: 'static>(&self) -> Option<ComponentId> {

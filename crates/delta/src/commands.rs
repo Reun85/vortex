@@ -8,6 +8,7 @@ use crate::{
     blob_vec::DropFn,
     component::{ComponentId, Components, drop_fn},
     entity::{Entities, Entity},
+    observer::Event,
     system::{Access, SystemParam},
     tick::Tick,
     world::{World, WorldCell},
@@ -170,6 +171,17 @@ impl CommandQueue {
     /// reserved while recording become alive first, so commands may target
     /// them even if they have no other command.
     pub fn apply(&mut self, world: &mut World) {
+        world.apply_depth += 1;
+        self.apply_inner(world);
+        world.apply_depth -= 1;
+        // Hooks and observers may have queued more work; it runs before the
+        // sync point ends, in rounds.
+        world.finish_op();
+    }
+
+    /// Applies the commands without running the work they spawn; the caller
+    /// is responsible for `World::flush_deferred`.
+    pub(crate) fn apply_inner(&mut self, world: &mut World) {
         world.flush_entities();
         let bytes = mem::take(&mut self.bytes);
         let mut customs = mem::take(&mut self.customs).into_iter();
@@ -446,6 +458,24 @@ pub struct Commands<'w, 's> {
 }
 
 impl<'w, 's> Commands<'w, 's> {
+    pub(crate) fn new(
+        queue: &'s mut CommandQueue,
+        entities: &'w Entities,
+    ) -> Self {
+        Self { queue, entities }
+    }
+
+    /// Emits `event` at `target`; observers run at the sync point, in order
+    /// with the other commands.
+    pub fn emit<E: Event>(&mut self, target: Entity, event: E) {
+        self.queue
+            .push(move |w| w.trigger_or_defer(Some(target), event));
+    }
+
+    pub fn emit_global<E: Event>(&mut self, event: E) {
+        self.queue.push(move |w| w.trigger_or_defer(None, event));
+    }
+
     /// Reserves an entity now; it exists and gets its components at the sync
     /// point.
     pub fn spawn(&mut self) -> EntityCommands<'_, 'w, 's> {
@@ -694,6 +724,7 @@ mod tests {
             clone: None,
             kind: Kind::Native,
             storage: Storage::Table,
+            hooks: Default::default(),
         })
     }
 
