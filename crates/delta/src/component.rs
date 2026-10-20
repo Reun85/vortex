@@ -6,6 +6,10 @@ use crate::blob_vec::DropFn;
 pub struct ComponentId(u32);
 
 impl ComponentId {
+    pub(crate) const fn from_index(index: u32) -> Self {
+        Self(index)
+    }
+
     pub const fn index(self) -> usize {
         self.0 as usize
     }
@@ -121,7 +125,7 @@ impl Components {
     }
 }
 
-unsafe fn drop_fn<T>(p: *mut u8) {
+pub(crate) unsafe fn drop_fn<T>(p: *mut u8) {
     // SAFETY: caller guarantees `p` points to an initialized `T`.
     unsafe { ptr::drop_in_place(p.cast::<T>()) }
 }

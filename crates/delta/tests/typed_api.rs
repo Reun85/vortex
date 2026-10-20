@@ -352,3 +352,64 @@ fn mut_marks_changed_only_when_written_through() {
     assert_eq!(seen(&world), 2);
     assert_eq!(world.get::<Health>(e), Some(&Health(2)));
 }
+
+/// Milestone 6 exit: `spawn().insert(A).insert(B)` performs exactly one
+/// archetype move, through the real `Commands` parameter.
+#[test]
+fn spawn_insert_insert_moves_exactly_once() {
+    fn spawner(mut commands: Commands) {
+        commands
+            .spawn()
+            .insert(Position(1.0, 2.0))
+            .insert(Velocity(3.0, 4.0))
+            .insert(Health(5));
+    }
+    let mut world = World::new();
+    let mut schedule = Schedule::new();
+    schedule.add_system(Stage::Update, spawner);
+
+    schedule.run(&mut world);
+    assert_eq!(world.archetype_moves(), 1);
+    assert_eq!(world.entities().len(), 1);
+
+    // Ten more entities cost exactly ten more moves, not thirty.
+    for _ in 0..10 {
+        schedule.run(&mut world);
+    }
+    assert_eq!(world.archetype_moves(), 11);
+    assert_eq!(world.entities().len(), 11);
+}
+
+#[test]
+fn reserved_entity_is_usable_before_the_sync_point() {
+    fn build(mut commands: Commands) {
+        let parent = commands.spawn().insert(Health(1)).id();
+        // The child refers to the parent before either exists.
+        commands.spawn().insert(Parent(parent));
+        commands.entity(parent).insert(Position(0.0, 0.0));
+    }
+    #[derive(Clone, Copy)]
+    struct Parent(Entity);
+
+    fn check(
+        children: Query<&Parent>,
+        parents: Query<(&Position, &Health)>,
+        mut stats: ResMut<Stats>,
+    ) {
+        for child in &children {
+            // The reserved id the child stored now names a real entity.
+            assert!(parents.get(child.0).is_some());
+            stats.moved += 1;
+        }
+    }
+    let mut world = World::new();
+    world.insert_resource(Stats::default());
+    let mut schedule = Schedule::new();
+    schedule.add_system(Stage::Update, build);
+    schedule.add_system(Stage::LateUpdate, check);
+    schedule.run(&mut world);
+    // `check` runs after the Update sync point, so both entities exist and
+    // the parent has all of its components.
+    assert_eq!(world.entities().len(), 2);
+    assert_eq!(world.resource::<Stats>().unwrap().moved, 1);
+}

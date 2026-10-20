@@ -35,6 +35,7 @@ pub struct World {
     change_tick: Tick,
     resources: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     last_check_tick: Tick,
+    archetype_moves: u64,
 }
 
 impl Default for World {
@@ -54,6 +55,7 @@ impl World {
             change_tick: Tick::new(1),
             resources: HashMap::new(),
             last_check_tick: Tick::new(1),
+            archetype_moves: 0,
         }
     }
 
@@ -88,6 +90,12 @@ impl World {
 
     pub fn archetypes(&self) -> &Archetypes {
         &self.archetypes
+    }
+
+    /// How many times an entity has changed archetype, the expensive
+    /// structural operation that command batching exists to minimize.
+    pub fn archetype_moves(&self) -> u64 {
+        self.archetype_moves
     }
 
     pub fn change_tick(&self) -> Tick {
@@ -185,7 +193,60 @@ impl World {
             .archetypes
             .with_added(loc.archetype, c, &self.components);
         // SAFETY: src is valid per the contract.
-        unsafe { self.move_entity(e, loc, to, Some((c, src))) };
+        unsafe { self.move_entity(e, loc, to, &[(c, src)]) };
+        Ok(())
+    }
+
+    /// Adds several components to `e` at once, overwriting any it already
+    /// has. The entity changes archetype at most once, straight to the final
+    /// one, without passing through intermediate archetypes.
+    ///
+    /// # Safety
+    /// Every `src` must satisfy [`insert_by_id`](Self::insert_by_id)'s
+    /// contract, and the component ids must be distinct. The world takes
+    /// ownership of all values only if this returns `Ok`.
+    ///
+    /// # Panics
+    /// If any component uses sparse-set storage.
+    pub unsafe fn insert_many_by_id(
+        &mut self,
+        e: Entity,
+        items: &[(ComponentId, *const u8)],
+    ) -> Result<(), DeadEntity> {
+        for &(c, _) in items {
+            assert!(
+                self.components.info(c).storage == Storage::Table,
+                "sparse-set storage is not implemented yet"
+            );
+        }
+        self.flush_entities();
+        let loc = self.entities.location(e).ok_or(DeadEntity(e))?;
+        let tick = self.change_tick;
+        let arch = self.archetypes.get_mut(loc.archetype);
+        let mut added = Vec::new();
+        for &(c, src) in items {
+            match arch.column_mut(c) {
+                // SAFETY: src is valid per the contract.
+                Some(col) => unsafe { col.replace(loc.row, src, tick) },
+                None => added.push((c, src)),
+            }
+        }
+        let to = match added[..] {
+            [] => return Ok(()),
+            [(c, _)] => {
+                self.archetypes
+                    .with_added(loc.archetype, c, &self.components)
+            }
+            _ => {
+                let mut comps =
+                    self.archetypes.get(loc.archetype).components().to_vec();
+                comps.extend(added.iter().map(|&(c, _)| c));
+                comps.sort_unstable();
+                self.archetypes.get_or_create(&comps, &self.components)
+            }
+        };
+        // SAFETY: `added` holds exactly the destination's new components.
+        unsafe { self.move_entity(e, loc, to, &added) };
         Ok(())
     }
 
@@ -205,7 +266,7 @@ impl World {
             self.archetypes
                 .with_removed(loc.archetype, c, &self.components);
         // SAFETY: no extra component is added.
-        unsafe { self.move_entity(e, loc, to, None) };
+        unsafe { self.move_entity(e, loc, to, &[]) };
         Ok(true)
     }
 
@@ -296,18 +357,19 @@ impl World {
 
     /// Moves `e` from `loc`'s archetype to `to`. Columns shared by both are
     /// moved bytewise (ticks kept), columns only in the source are dropped,
-    /// and `extra` supplies the one column only in the destination.
+    /// and `extra` supplies every column only in the destination.
     ///
     /// # Safety
-    /// `extra`, when given, must satisfy [`insert_by_id`](Self::insert_by_id)'s
-    /// contract and be exactly the destination's additional component.
+    /// `extra` must hold exactly the destination's additional components,
+    /// each satisfying [`insert_by_id`](Self::insert_by_id)'s contract.
     unsafe fn move_entity(
         &mut self,
         e: Entity,
         loc: EntityLocation,
         to: ArchetypeId,
-        extra: Option<(ComponentId, *const u8)>,
+        extra: &[(ComponentId, *const u8)],
     ) {
+        self.archetype_moves += 1;
         let tick = self.change_tick;
         let (src, dst) = self.archetypes.get_two_mut(loc.archetype, to);
         let new_row = dst.push_entity(e);
@@ -320,9 +382,10 @@ impl World {
                     dcol.push_moved_from(&src.columns()[si], loc.row);
                 },
                 None => {
-                    let (extra_id, ptr) =
-                        extra.expect("destination has an unexpected column");
-                    debug_assert_eq!(extra_id, c);
+                    let &(_, ptr) = extra
+                        .iter()
+                        .find(|(id, _)| *id == c)
+                        .expect("destination has an unexpected column");
                     // SAFETY: forwarded from this fn's contract.
                     unsafe { dcol.push(ptr, tick) };
                 }
