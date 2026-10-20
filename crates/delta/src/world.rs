@@ -16,7 +16,7 @@ use crate::{
     hooks::{DeferredWorld, Hook, HooksBuilder},
     observer::{Events, ObserverIndex, TriggerFrame},
     reflect::TypeRegistry,
-    scene::SceneId,
+    scene::{Retired, SceneId},
     tick::{CHECK_TICK_THRESHOLD, Tick},
 };
 
@@ -63,6 +63,8 @@ pub struct World {
     pub(crate) reflection: TypeRegistry,
     /// Kept patched by hooks on [`SceneId`], so it follows spawn and despawn.
     pub(crate) scene_ids: HashMap<SceneId, Entity>,
+    /// Despawned scene entities, when tracking is on.
+    pub(crate) retired: Option<Retired>,
 }
 
 impl Default for World {
@@ -93,6 +95,7 @@ impl World {
             message_updaters: Vec::new(),
             reflection: TypeRegistry::default(),
             scene_ids: HashMap::new(),
+            retired: None,
         };
         crate::scene::init(&mut world);
         world
@@ -256,6 +259,13 @@ impl World {
         if self.components.any_hooks() {
             let ids = self.archetypes.get(loc.archetype).components().to_vec();
             self.fire_remove_hooks(e, &ids);
+        }
+        if self.retired.is_some()
+            && let Some(id) = self.scene_id_of(e)
+        {
+            let retired = self.retired.as_mut().expect("checked above");
+            retired.by_handle.insert(e, id);
+            retired.by_id.insert(id, e);
         }
         self.entities.free(e);
         let arch = self.archetypes.get_mut(loc.archetype);

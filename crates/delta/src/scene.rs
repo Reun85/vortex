@@ -103,9 +103,24 @@ pub struct LoadReport {
 
 const SCENE_VERSION: u64 = 1;
 
+/// Scene entities that were despawned, by the handle they had and the
+/// [`SceneId`] they carried. Lets a reference that now dangles still be
+/// *described* (in an undo snapshot, say) and later re-pointed.
+#[derive(Default)]
+pub(crate) struct Retired {
+    pub(crate) by_handle: HashMap<Entity, SceneId>,
+    pub(crate) by_id: HashMap<SceneId, Entity>,
+}
+
 fn scene_id_inserted(w: DeferredWorld<'_>, e: Entity) {
     let id = *w.get::<SceneId>(e).expect("hook runs with the component");
     w.world.scene_ids.insert(id, e);
+    // The identity is alive again; it no longer dangles.
+    if let Some(retired) = &mut w.world.retired
+        && let Some(old) = retired.by_id.remove(&id)
+    {
+        retired.by_handle.remove(&old);
+    }
 }
 
 fn scene_id_replaced(w: DeferredWorld<'_>, e: Entity) {
@@ -176,14 +191,74 @@ impl World {
         self.get::<SceneId>(e).copied()
     }
 
-    fn entity_ref_to_json(&self, e: Entity) -> Value {
+    pub(crate) fn entity_ref_to_json(&self, e: Entity) -> Value {
         self.scene_id_of(e)
+            .or_else(|| self.retired.as_ref()?.by_handle.get(&e).copied())
             .map_or(Value::Null, |id| Value::String(id.to_string()))
+    }
+
+    /// Starts remembering which [`SceneId`] each despawned scene entity had,
+    /// so references to it can still be saved and later restored. Editors
+    /// turn this on; games that never undo need not.
+    pub fn track_retired_entities(&mut self) {
+        self.retired.get_or_insert_with(Retired::default);
+    }
+
+    /// Forgets the despawned entities remembered so far.
+    pub fn forget_retired_entities(&mut self) {
+        if let Some(retired) = &mut self.retired {
+            *retired = Retired::default();
+        }
     }
 
     /// The scene as a JSON value: every entity that has a [`SceneId`], with
     /// its reflected components. Entities are ordered by id and components by
     /// name, so equal worlds always produce equal text.
+    /// One entity as it appears in a scene: its id and reflected components.
+    fn entity_value(&self, id: SceneId, arch: &Archetype, row: usize) -> Value {
+        let mut components = Map::new();
+        for (i, &c) in arch.components().iter().enumerate() {
+            let info = self.components.info(c);
+            let Some(reflect) = info.reflect else {
+                continue;
+            };
+            let ptr = arch.columns()[i].get_ptr(row);
+            let value = read_value(
+                &self.reflection,
+                &FieldType::Struct(reflect),
+                ptr,
+                &|e| self.entity_ref_to_json(e),
+            );
+            components.insert(info.name.to_string(), value);
+        }
+        let mut entity = Map::new();
+        entity.insert("id".into(), Value::String(id.to_string()));
+        entity.insert("components".into(), Value::Object(components));
+        Value::Object(entity)
+    }
+
+    /// One entity in scene form, if it is alive and has a [`SceneId`]. This
+    /// is what undo records so that a delete can be undone.
+    pub fn entity_to_value(&self, e: Entity) -> Option<Value> {
+        let loc = self.location(e)?;
+        let id = self.scene_id_of(e)?;
+        let arch = self.archetypes.get(loc.archetype);
+        Some(self.entity_value(id, arch, loc.row))
+    }
+
+    /// Creates entities from values made by
+    /// [`entity_to_value`](Self::entity_to_value), all at once, so they can
+    /// reference one another. Returns them in order.
+    pub fn spawn_from_values(
+        &mut self,
+        entities: &[Value],
+    ) -> Result<LoadReport, SceneError> {
+        let mut doc = Map::new();
+        doc.insert("version".into(), Value::from(SCENE_VERSION));
+        doc.insert("entities".into(), Value::Array(entities.to_vec()));
+        self.load_scene_value(&Value::Object(doc))
+    }
+
     pub fn scene_to_value(&self) -> Value {
         let scene_component = self.components.id_of::<SceneId>();
         let mut rows: Vec<(SceneId, &Archetype, usize)> = Vec::new();
@@ -201,27 +276,7 @@ impl World {
 
         let entities = rows
             .into_iter()
-            .map(|(id, arch, row)| {
-                let mut components = Map::new();
-                for (i, &c) in arch.components().iter().enumerate() {
-                    let info = self.components.info(c);
-                    let Some(reflect) = info.reflect else {
-                        continue;
-                    };
-                    let ptr = arch.columns()[i].get_ptr(row);
-                    let value = read_value(
-                        &self.reflection,
-                        &FieldType::Struct(reflect),
-                        ptr,
-                        &|e| self.entity_ref_to_json(e),
-                    );
-                    components.insert(info.name.to_string(), value);
-                }
-                let mut entity = Map::new();
-                entity.insert("id".into(), Value::String(id.to_string()));
-                entity.insert("components".into(), Value::Object(components));
-                Value::Object(entity)
-            })
+            .map(|(id, arch, row)| self.entity_value(id, arch, row))
             .collect();
 
         let mut doc = Map::new();
@@ -323,6 +378,7 @@ impl World {
             let buffer = ZeroedBuf::new(info.layout);
             let mut ctx = WriteCtx {
                 scene_ids: &self.scene_ids,
+                retired: self.retired.as_ref().map(|r| &r.by_id),
                 warnings,
             };
             write_value(
@@ -353,13 +409,13 @@ impl World {
 }
 
 /// A zero-initialized, correctly aligned scratch value.
-struct ZeroedBuf {
-    ptr: *mut u8,
+pub(crate) struct ZeroedBuf {
+    pub(crate) ptr: *mut u8,
     layout: Layout,
 }
 
 impl ZeroedBuf {
-    fn new(layout: Layout) -> Self {
+    pub(crate) fn new(layout: Layout) -> Self {
         let ptr = if layout.size() == 0 {
             ptr::without_provenance_mut(layout.align())
         } else {
@@ -407,7 +463,7 @@ fn parse_float(v: &Value) -> Option<f64> {
 }
 
 /// Turns the bytes of a reflected value into JSON.
-fn read_value(
+pub(crate) fn read_value(
     reg: &TypeRegistry,
     ty: &FieldType,
     p: *const u8,
@@ -470,9 +526,11 @@ fn read_value(
     }
 }
 
-struct WriteCtx<'a> {
-    scene_ids: &'a HashMap<SceneId, Entity>,
-    warnings: &'a mut Vec<String>,
+pub(crate) struct WriteCtx<'a> {
+    pub(crate) scene_ids: &'a HashMap<SceneId, Entity>,
+    /// Despawned scene entities, resolved to their old (dangling) handle.
+    pub(crate) retired: Option<&'a HashMap<SceneId, Entity>>,
+    pub(crate) warnings: &'a mut Vec<String>,
 }
 
 impl WriteCtx<'_> {
@@ -484,6 +542,9 @@ impl WriteCtx<'_> {
                     format!("{path}: `{s}` is not a scene id")
                 })?;
                 if let Some(&e) = self.scene_ids.get(&id) {
+                    Ok(e)
+                } else if let Some(&e) = self.retired.and_then(|r| r.get(&id)) {
+                    // Dangling before it was saved, dangling again now.
                     Ok(e)
                 } else {
                     self.warnings.push(format!(
@@ -499,7 +560,7 @@ impl WriteCtx<'_> {
 
 /// Fills `dst` from JSON. `dst` must be zeroed and large enough: fields
 /// missing from the JSON keep that zero default.
-fn write_value(
+pub(crate) fn write_value(
     reg: &TypeRegistry,
     ty: &FieldType,
     v: &Value,
