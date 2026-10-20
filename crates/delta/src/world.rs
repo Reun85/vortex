@@ -15,6 +15,8 @@ use crate::{
     entity::{Entities, Entity, EntityLocation},
     hooks::{DeferredWorld, Hook, HooksBuilder},
     observer::{Events, ObserverIndex, TriggerFrame},
+    reflect::TypeRegistry,
+    scene::SceneId,
     tick::{CHECK_TICK_THRESHOLD, Tick},
 };
 
@@ -58,6 +60,9 @@ pub struct World {
     pub(crate) observers: ObserverIndex,
     pub(crate) observer_hooks_registered: bool,
     pub(crate) message_updaters: Vec<MessageUpdater>,
+    pub(crate) reflection: TypeRegistry,
+    /// Kept patched by hooks on [`SceneId`], so it follows spawn and despawn.
+    pub(crate) scene_ids: HashMap<SceneId, Entity>,
 }
 
 impl Default for World {
@@ -70,7 +75,7 @@ impl World {
     pub fn new() -> Self {
         let components = Components::new();
         let archetypes = Archetypes::new(&components);
-        Self {
+        let mut world = Self {
             components,
             entities: Entities::new(),
             archetypes,
@@ -86,7 +91,11 @@ impl World {
             observers: ObserverIndex::default(),
             observer_hooks_registered: false,
             message_updaters: Vec::new(),
-        }
+            reflection: TypeRegistry::default(),
+            scene_ids: HashMap::new(),
+        };
+        crate::scene::init(&mut world);
+        world
     }
 
     pub fn insert_resource<T: Send + Sync + 'static>(&mut self, value: T) {

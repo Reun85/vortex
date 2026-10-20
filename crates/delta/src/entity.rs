@@ -8,6 +8,10 @@ use crate::archetype::ArchetypeId;
 pub struct Entity(u64);
 
 impl Entity {
+    /// A reference to nothing, for entity fields that point nowhere. Never
+    /// returned by the allocator.
+    pub const PLACEHOLDER: Entity = Entity(u64::MAX);
+
     pub const fn from_parts(index: u32, generation: u32) -> Self {
         Self((generation as u64) << 32 | index as u64)
     }

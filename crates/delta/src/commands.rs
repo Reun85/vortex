@@ -725,6 +725,7 @@ mod tests {
             kind: Kind::Native,
             storage: Storage::Table,
             hooks: Default::default(),
+            reflect: None,
         })
     }
 

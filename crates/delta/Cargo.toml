@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 fixedbitset.workspace = true
+delta_derive = { path = "../delta_derive" }
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [dev-dependencies]
 proptest.workspace = true

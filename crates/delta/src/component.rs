@@ -1,6 +1,6 @@
-use std::{alloc::Layout, any::TypeId, collections::HashMap, ptr};
+use std::{alloc::Layout, any::TypeId, collections::HashMap, mem, ptr};
 
-use crate::{blob_vec::DropFn, hooks::ComponentHooks};
+use crate::{blob_vec::DropFn, hooks::ComponentHooks, reflect::ReflectId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ComponentId(u32);
@@ -42,6 +42,8 @@ pub struct ComponentInfo {
     pub kind: Kind,
     pub storage: Storage,
     pub hooks: ComponentHooks,
+    /// Field layout for the inspector, undo and scene files, if reflected.
+    pub reflect: Option<ReflectId>,
 }
 
 #[derive(Default)]
@@ -84,9 +86,43 @@ impl Components {
         if let Some(&id) = self.by_type.get(&TypeId::of::<T>()) {
             return id;
         }
+        self.register_named::<T>(std::any::type_name::<T>(), None)
+    }
+
+    /// Registers a Rust type under a stable `name`. If the type was already
+    /// registered (for instance by a plain `insert`), it is renamed and keeps
+    /// its id, so the stable name always wins.
+    ///
+    /// # Panics
+    /// If `name` already belongs to a different component.
+    pub fn register_named<T: Send + Sync + 'static>(
+        &mut self,
+        name: &str,
+        reflect: Option<ReflectId>,
+    ) -> ComponentId {
+        if let Some(&id) = self.by_type.get(&TypeId::of::<T>()) {
+            if &*self.infos[id.index()].name != name {
+                assert!(
+                    !self.by_name.contains_key(name),
+                    "component name `{name}` is used by another component"
+                );
+                let old =
+                    mem::replace(&mut self.infos[id.index()].name, name.into());
+                self.by_name.remove(&old);
+                self.by_name.insert(name.into(), id);
+            }
+            if reflect.is_some() {
+                self.infos[id.index()].reflect = reflect;
+            }
+            return id;
+        }
+        assert!(
+            !self.by_name.contains_key(name),
+            "component name `{name}` is used by another component"
+        );
         let layout = Layout::new::<T>();
         let id = self.register_raw(ComponentInfo {
-            name: std::any::type_name::<T>().into(),
+            name: name.into(),
             layout,
             drop: std::mem::needs_drop::<T>().then_some(drop_fn::<T>),
             clone: None,
@@ -97,6 +133,7 @@ impl Components {
             },
             storage: Storage::Table,
             hooks: ComponentHooks::default(),
+            reflect,
         });
         self.by_type.insert(TypeId::of::<T>(), id);
         id
