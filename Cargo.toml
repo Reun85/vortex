@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# Reference-only utility crate to copy code from; never part of the build.
+exclude = ["basalt"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+fixedbitset = "0.5"
+proptest = "1"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -3 }

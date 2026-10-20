@@ -1,0 +1,52 @@
+[package]
+name = "basalt"
+version = "0.1.0"
+edition = "2024"
+
+
+[features]
+default = ["use_own_log"]
+full = ["promise", "strict_assert", "use_own_log"]
+use_own_log = []
+strict_assert = []
+
+promise = []
+
+
+[dependencies]
+
+smart-default.workspace=true
+thiserror.workspace=true
+derive_more.workspace=true
+bitflags.workspace=true
+smallvec.workspace=true
+tracing.workspace=true
+tracing-subscriber.workspace=true
+bytemuck.workspace=true
+konst.workspace=true
+
+good_lp.workspace=true
+rayon.workspace=true
+
+
+
+
+[lints.clippy]
+
+correctness = { level = "deny", priority = -3 }
+complexity = { level = "deny", priority = -3 }
+all = { level = "deny", priority = -3 }
+
+perf = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# I personally dislike these lints.
+option_if_let_else = "allow"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(build_type, values("debug","release","dist"))',
+  'cfg(debug)',
+] }

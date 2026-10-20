@@ -1,0 +1,13 @@
+[package]
+name = "delta"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fixedbitset.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

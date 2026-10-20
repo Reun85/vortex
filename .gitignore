@@ -1,0 +1,13 @@
+target
+Cargo.lock
+.direnv
+flamegraph.svg
+perf.data
+perf.data.old
+TODO.md
+count_lines.sh
+*.log
+renderdoc
+out.log
+evaluation/results
+/.devenv
