@@ -61,6 +61,17 @@ impl Schedule {
         self
     }
 
+    /// Adds a system that is not a plain function, such as one backed by a
+    /// scripting runtime.
+    pub fn add_boxed_system(
+        &mut self,
+        stage: Stage,
+        system: Box<dyn System>,
+    ) -> &mut Self {
+        self.stages[stage as usize].push(system);
+        self
+    }
+
     /// How many times `FixedUpdate` runs per [`run`](Self::run).
     pub fn set_fixed_steps(&mut self, steps: u32) -> &mut Self {
         self.fixed_steps = steps;

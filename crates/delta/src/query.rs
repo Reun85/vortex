@@ -302,7 +302,7 @@ impl QueryState {
     /// the columns this query writes (when `stamp` is set, the cell must come
     /// from `&mut World`), and no previously returned chunk may still be in
     /// use when stamping, since stamping mutates column metadata.
-    pub(crate) unsafe fn next_chunk<'a>(
+    pub unsafe fn next_chunk<'a>(
         &'a self,
         world: WorldCell<'a>,
         cursor: &mut Cursor,
@@ -376,10 +376,22 @@ impl QueryState {
 }
 
 /// Position of a pull-style iteration over a [`QueryState`].
+///
+/// `repr(C)` so a scripting host can keep it in its own memory as opaque
+/// bytes; start from `Cursor::default()`.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Cursor {
     matched: usize,
     row: usize,
+}
+
+impl Cursor {
+    /// Whether no chunk has been taken yet: the moment to
+    /// [`QueryState::update`] a query that spans frames.
+    pub fn is_start(&self) -> bool {
+        self.matched == 0 && self.row == 0
+    }
 }
 
 /// A run of consecutive rows of one archetype: the shared iteration

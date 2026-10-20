@@ -128,6 +128,10 @@ impl World {
         &self.reflection
     }
 
+    pub fn reflection_mut(&mut self) -> &mut TypeRegistry {
+        &mut self.reflection
+    }
+
     /// Registers `T` as a component under its reflected, stable name and
     /// records its layout for scenes, the inspector and undo.
     ///

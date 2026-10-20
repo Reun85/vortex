@@ -29,6 +29,9 @@ let
     vulkan-tools
     vulkan-tools-lunarg
 
+    ## C# scripting host (CoreCLR) and script assemblies
+    dotnetCorePackages.sdk_10_0
+
     ## For Dev
     cloc
     cargo-audit

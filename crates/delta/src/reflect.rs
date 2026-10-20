@@ -14,6 +14,11 @@ use crate::entity::Entity;
 pub struct ReflectId(u32);
 
 impl ReflectId {
+    /// For hosts that pass ids across an FFI boundary as plain integers.
+    pub const fn from_index(index: u32) -> Self {
+        Self(index)
+    }
+
     pub const fn index(self) -> usize {
         self.0 as usize
     }
@@ -119,6 +124,43 @@ impl TypeRegistry {
 
     pub fn get(&self, id: ReflectId) -> &TypeReflect {
         &self.types[id.index()]
+    }
+
+    /// Registers a type known only by data, such as a script-declared
+    /// struct. Registering the same name with the same layout again returns
+    /// the existing id.
+    ///
+    /// # Errors
+    /// If `name` is already registered with a different layout.
+    pub fn register_dynamic(
+        &mut self,
+        name: &str,
+        size: usize,
+        align: usize,
+        fields: Vec<FieldReflect>,
+    ) -> Result<ReflectId, String> {
+        if let Some(&id) = self.by_name.get(name) {
+            let existing = &self.types[id.index()];
+            return if existing.size == size
+                && existing.align == align
+                && *existing.fields == *fields
+            {
+                Ok(id)
+            } else {
+                Err(format!(
+                    "type `{name}` is already registered with a different layout"
+                ))
+            };
+        }
+        let id = ReflectId(u32::try_from(self.types.len()).expect("types"));
+        self.types.push(TypeReflect {
+            name: name.into(),
+            size,
+            align,
+            fields: fields.into(),
+        });
+        self.by_name.insert(name.into(), id);
+        Ok(id)
     }
 
     /// Registers `T`. Used by the derive; call [`Reflect::reflect_id`]

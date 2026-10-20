@@ -6,7 +6,8 @@ use crate::{blob_vec::DropFn, hooks::ComponentHooks, reflect::ReflectId};
 pub struct ComponentId(u32);
 
 impl ComponentId {
-    pub(crate) const fn from_index(index: u32) -> Self {
+    /// For hosts that pass ids across an FFI boundary as plain integers.
+    pub const fn from_index(index: u32) -> Self {
         Self(index)
     }
 

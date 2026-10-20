@@ -1,0 +1,11 @@
+[package]
+name = "delta_script"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+delta = { path = "../delta" }
+libloading = "0.8"
+
+[lints]
+workspace = true

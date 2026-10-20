@@ -11,3 +11,7 @@ renderdoc
 out.log
 evaluation/results
 /.devenv
+
+# C# build output
+obj/
+bin/
