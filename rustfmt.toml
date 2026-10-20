@@ -1,0 +1,16 @@
+# Use the 2024 edition features
+edition = "2024"
+
+# Since Edition 2024 is still unstable/nightly, 
+# this flag is required for the edition setting to work.
+unstable_features = true
+
+# Optional: Common formatting preferences for modern Rust
+group_imports = "StdExternalCrate"
+imports_granularity = "Crate"
+newline_style = "Unix"
+format_macro_bodies = true
+format_macro_matchers = true
+
+imports_layout = "HorizontalVertical"
+max_width = 80

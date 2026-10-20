@@ -1,0 +1,10 @@
+[toolchain]
+channel = "nightly"
+components = [
+  "rustfmt",
+  "clippy",
+  "rust-src",           # Required for rust-analyzer to provide std-lib completions
+  "rust-analyzer",
+  "llvm-tools-preview", # Useful for coverage and profiling (like tracy/renderdoc)
+  "miri",
+]
