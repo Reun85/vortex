@@ -1,4 +1,11 @@
-use std::{fmt, mem::ManuallyDrop};
+use std::{
+    any::{Any, TypeId},
+    collections::HashMap,
+    fmt,
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    ptr,
+};
 
 use crate::{
     archetype::{ArchetypeId, Archetypes},
@@ -25,6 +32,7 @@ pub struct World {
     entities: Entities,
     archetypes: Archetypes,
     change_tick: Tick,
+    resources: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
 }
 
 impl Default for World {
@@ -42,7 +50,25 @@ impl World {
             entities: Entities::new(),
             archetypes,
             change_tick: Tick::new(1),
+            resources: HashMap::new(),
         }
+    }
+
+    pub fn insert_resource<T: Send + Sync + 'static>(&mut self, value: T) {
+        self.resources.insert(TypeId::of::<T>(), Box::new(value));
+    }
+
+    pub fn remove_resource<T: Send + Sync + 'static>(&mut self) -> Option<T> {
+        let boxed = self.resources.remove(&TypeId::of::<T>())?;
+        boxed.downcast().ok().map(|b| *b)
+    }
+
+    pub fn resource<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.resources.get(&TypeId::of::<T>())?.downcast_ref()
+    }
+
+    pub fn resource_mut<T: Send + Sync + 'static>(&mut self) -> Option<&mut T> {
+        self.resources.get_mut(&TypeId::of::<T>())?.downcast_mut()
     }
 
     pub fn components(&self) -> &Components {
@@ -59,10 +85,6 @@ impl World {
 
     pub fn archetypes(&self) -> &Archetypes {
         &self.archetypes
-    }
-
-    pub(crate) fn archetypes_mut(&mut self) -> &mut Archetypes {
-        &mut self.archetypes
     }
 
     pub fn change_tick(&self) -> Tick {
@@ -316,6 +338,99 @@ impl World {
             }
         }
         assert_eq!(total, self.entities.len());
+    }
+}
+
+/// Shared handle to a world for system parameters.
+///
+/// Several parameters of one system hold a `WorldCell` at the same time, each
+/// touching disjoint parts (different component columns, different resources,
+/// the entity allocator). Declared access sets are what make that sound, so
+/// every accessor is `unsafe`: the caller promises not to alias.
+#[derive(Clone, Copy)]
+pub struct WorldCell<'w> {
+    world: *mut World,
+    _marker: PhantomData<&'w World>,
+}
+
+impl<'w> WorldCell<'w> {
+    pub fn new(world: &'w mut World) -> Self {
+        Self {
+            world,
+            _marker: PhantomData,
+        }
+    }
+
+    /// A cell that must only be used for reads.
+    pub fn from_ref(world: &'w World) -> Self {
+        Self {
+            world: ptr::from_ref(world).cast_mut(),
+            _marker: PhantomData,
+        }
+    }
+
+    /// # Safety
+    /// No live `&mut` to anything inside the world.
+    pub unsafe fn world(self) -> &'w World {
+        // SAFETY: per contract.
+        unsafe { &*self.world }
+    }
+
+    /// # Safety
+    /// Exclusive access to the whole world, and the cell was built from
+    /// `&mut World`.
+    pub unsafe fn world_mut(self) -> &'w mut World {
+        // SAFETY: per contract.
+        unsafe { &mut *self.world }
+    }
+
+    /// # Safety
+    /// Nobody holds `&mut` to the entity allocator.
+    pub unsafe fn entities(self) -> &'w Entities {
+        // SAFETY: field projection without creating `&World`.
+        unsafe { &*ptr::addr_of!((*self.world).entities) }
+    }
+
+    /// # Safety
+    /// Nobody holds `&mut` to the archetypes.
+    pub unsafe fn archetypes(self) -> &'w Archetypes {
+        // SAFETY: field projection without creating `&World`.
+        unsafe { &*ptr::addr_of!((*self.world).archetypes) }
+    }
+
+    /// # Safety
+    /// Exclusive access to the archetype metadata being modified (in
+    /// practice: change-tick stamping of columns this caller may write), and
+    /// the cell was built from `&mut World`.
+    pub(crate) unsafe fn archetypes_mut(self) -> &'w mut Archetypes {
+        // SAFETY: field projection without creating `&mut World`.
+        unsafe { &mut *ptr::addr_of_mut!((*self.world).archetypes) }
+    }
+
+    pub fn change_tick(self) -> Tick {
+        // SAFETY: a plain copy of a field nobody mutates during a system run.
+        unsafe { *ptr::addr_of!((*self.world).change_tick) }
+    }
+
+    /// # Safety
+    /// Nobody holds `&mut` to the resource `T`.
+    pub unsafe fn resource<T: Send + Sync + 'static>(self) -> Option<&'w T> {
+        // SAFETY: field projection; resources are only mutated through
+        // `resource_mut` under the declared access rules.
+        let map = unsafe { &*ptr::addr_of!((*self.world).resources) };
+        map.get(&TypeId::of::<T>())?.downcast_ref()
+    }
+
+    /// # Safety
+    /// Exclusive access to the resource `T`, and the cell was built from
+    /// `&mut World`.
+    pub unsafe fn resource_mut<T: Send + Sync + 'static>(
+        self,
+    ) -> Option<&'w mut T> {
+        // SAFETY: as above; the boxed value is a separate allocation, so this
+        // does not overlap other resources.
+        let map = unsafe { &mut *ptr::addr_of_mut!((*self.world).resources) };
+        map.get_mut(&TypeId::of::<T>())?.downcast_mut()
     }
 }
 

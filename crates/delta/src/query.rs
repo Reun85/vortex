@@ -3,12 +3,12 @@ use std::{fmt, ops::Range};
 use fixedbitset::FixedBitSet;
 
 use crate::{
-    archetype::{Archetype, ArchetypeId},
+    archetype::{Archetype, ArchetypeId, Archetypes},
     column::Column,
     component::ComponentId,
-    entity::Entity,
+    entity::{Entity, EntityLocation},
     tick::Tick,
-    world::World,
+    world::{World, WorldCell},
 };
 
 /// Marks an optional term whose component the archetype lacks.
@@ -196,7 +196,10 @@ impl QueryState {
 
     /// Checks archetypes created since the last call.
     pub fn update(&mut self, world: &World) {
-        let archetypes = world.archetypes();
+        self.update_archetypes(world.archetypes());
+    }
+
+    pub(crate) fn update_archetypes(&mut self, archetypes: &Archetypes) {
         for arch in archetypes.iter().skip(self.seen_archetypes) {
             if self.required.is_subset(arch.bits())
                 && self.excluded.is_disjoint(arch.bits())
@@ -252,13 +255,13 @@ impl QueryState {
             "query has write terms; use for_each_chunk_mut"
         );
         self.update(world);
-        for m in &self.matched {
-            let arch = world.archetypes().get(m.archetype);
-            let mut start = 0;
-            while let Some(rows) = m.next_run(arch, start, last_run) {
-                start = rows.end;
-                f(Chunk::new(arch, m, rows));
-            }
+        let cell = WorldCell::from_ref(world);
+        let mut cursor = Cursor::default();
+        // SAFETY: nothing else touches the world; no stamping happens.
+        while let Some(chunk) =
+            unsafe { self.next_chunk(cell, &mut cursor, last_run, false) }
+        {
+            f(chunk);
         }
     }
 
@@ -272,27 +275,102 @@ impl QueryState {
         mut f: impl FnMut(Chunk<'_>),
     ) {
         self.update(world);
-        let tick = world.change_tick();
-        let writes =
-            self.desc.read.len()..self.desc.read.len() + self.desc.write.len();
-        for m in &self.matched {
-            let mut start = 0;
-            loop {
-                let arch = world.archetypes().get(m.archetype);
-                let Some(rows) = m.next_run(arch, start, last_run) else {
-                    break;
-                };
-                start = rows.end;
-                let arch = world.archetypes_mut().get_mut(m.archetype);
-                for term in writes.clone() {
-                    arch.columns_mut()[m.columns[term]]
-                        .set_changed_range(rows.clone(), tick);
-                }
-                let arch = world.archetypes().get(m.archetype);
-                f(Chunk::new(arch, m, rows));
-            }
+        let cell = WorldCell::new(world);
+        let mut cursor = Cursor::default();
+        // SAFETY: `world` is exclusively borrowed for the whole loop and `f`
+        // cannot reach it.
+        while let Some(chunk) =
+            unsafe { self.next_chunk(cell, &mut cursor, last_run, true) }
+        {
+            f(chunk);
         }
     }
+
+    /// Advances `cursor` to the next run of matching rows. With `stamp`, the
+    /// run's write columns are marked changed at the current world tick
+    /// before it is returned.
+    ///
+    /// # Safety
+    /// The query must be up to date. The caller must have exclusive access to
+    /// the columns this query writes (when `stamp` is set, the cell must come
+    /// from `&mut World`), and no previously returned chunk may still be in
+    /// use when stamping, since stamping mutates column metadata.
+    pub(crate) unsafe fn next_chunk<'a>(
+        &'a self,
+        world: WorldCell<'a>,
+        cursor: &mut Cursor,
+        last_run: Tick,
+        stamp: bool,
+    ) -> Option<Chunk<'a>> {
+        while let Some(m) = self.matched.get(cursor.matched) {
+            // SAFETY: per contract.
+            let arch = unsafe { world.archetypes() }.get(m.archetype);
+            if let Some(rows) = m.next_run(arch, cursor.row, last_run) {
+                cursor.row = rows.end;
+                // SAFETY: per contract.
+                return Some(unsafe { self.chunk(world, m, rows, stamp) });
+            }
+            cursor.matched += 1;
+            cursor.row = 0;
+        }
+        None
+    }
+
+    /// The single-row chunk for the entity at `loc`, if it matches.
+    ///
+    /// # Safety
+    /// Same as [`next_chunk`](Self::next_chunk).
+    pub(crate) unsafe fn chunk_at<'a>(
+        &'a self,
+        world: WorldCell<'a>,
+        loc: EntityLocation,
+        last_run: Tick,
+        stamp: bool,
+    ) -> Option<Chunk<'a>> {
+        let i = self
+            .matched
+            .binary_search_by_key(&loc.archetype, |m| m.archetype)
+            .ok()?;
+        let m = &self.matched[i];
+        // SAFETY: per contract.
+        let arch = unsafe { world.archetypes() }.get(m.archetype);
+        if !m.row_passes(arch, loc.row, last_run) {
+            return None;
+        }
+        // SAFETY: per contract.
+        Some(unsafe { self.chunk(world, m, loc.row..loc.row + 1, stamp) })
+    }
+
+    /// # Safety
+    /// See [`next_chunk`](Self::next_chunk).
+    unsafe fn chunk<'a>(
+        &'a self,
+        world: WorldCell<'a>,
+        m: &'a Match,
+        rows: Range<usize>,
+        stamp: bool,
+    ) -> Chunk<'a> {
+        if stamp && !self.desc.write.is_empty() {
+            let tick = world.change_tick();
+            let r = self.desc.read.len();
+            // SAFETY: per contract.
+            let arch = unsafe { world.archetypes_mut() }.get_mut(m.archetype);
+            for term in r..r + self.desc.write.len() {
+                arch.columns_mut()[m.columns[term]]
+                    .set_changed_range(rows.clone(), tick);
+            }
+        }
+        // SAFETY: per contract.
+        let arch = unsafe { world.archetypes() }.get(m.archetype);
+        Chunk::new(arch, m, rows)
+    }
+}
+
+/// Position of a pull-style iteration over a [`QueryState`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Cursor {
+    matched: usize,
+    row: usize,
 }
 
 /// A run of consecutive rows of one archetype: the shared iteration
