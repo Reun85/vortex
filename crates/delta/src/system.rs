@@ -305,6 +305,9 @@ pub trait System: 'static {
     fn run(&mut self, world: &mut World);
     /// Applies deferred work (commands) at a sync point.
     fn apply_deferred(&mut self, world: &mut World);
+    /// Clamps the system's remembered `last_run`, see
+    /// [`World::check_change_ticks`].
+    fn check_change_tick(&mut self, now: Tick);
 }
 
 pub trait IntoSystem<Marker> {
@@ -406,6 +409,10 @@ impl<Marker: 'static, F: SystemParamFunction<Marker>> System
         world.increment_change_tick();
     }
 
+    fn check_change_tick(&mut self, now: Tick) {
+        self.last_run.check_tick(now);
+    }
+
     fn apply_deferred(&mut self, world: &mut World) {
         if let Some(state) = self.state.as_mut() {
             F::Param::apply(state, world);
@@ -424,5 +431,24 @@ impl<Marker: 'static, F: SystemParamFunction<Marker>> IntoSystem<Marker> for F {
             last_run: Tick::new(0),
             _marker: PhantomData,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tick::MAX_CHANGE_AGE;
+
+    #[test]
+    fn check_change_tick_clamps_last_run() {
+        fn noop() {}
+        let mut world = World::new();
+        let mut system = IntoSystem::into_system(noop);
+        system.run(&mut world);
+        assert_eq!(system.last_run, Tick::new(1));
+
+        let now = Tick::new(MAX_CHANGE_AGE + 100);
+        system.check_change_tick(now);
+        assert_eq!(now.relative_to(system.last_run).get(), MAX_CHANGE_AGE);
     }
 }

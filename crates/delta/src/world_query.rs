@@ -4,11 +4,12 @@
 use std::marker::PhantomData;
 
 use crate::{
+    change::Mut,
     component::ComponentId,
     entity::Entity,
     query::{Chunk, Cursor, QueryDesc, QueryState},
     system::{Access, SystemParam},
-    tick::Tick,
+    tick::{Tick, TickCell},
     world::{World, WorldCell},
 };
 
@@ -27,6 +28,8 @@ pub unsafe trait WorldQuery {
     /// Adds this query's terms to the description.
     fn update_desc(state: &Self::State, desc: &mut QueryDesc);
 
+    /// `this_run` is the world's change tick, used by [`Mut`] to stamp writes.
+    ///
     /// # Safety
     /// `chunk` must come from a query built from a description that all
     /// involved states added their terms to.
@@ -34,6 +37,7 @@ pub unsafe trait WorldQuery {
         state: &Self::State,
         desc: &QueryDesc,
         chunk: &Chunk<'w>,
+        this_run: Tick,
     ) -> Self::Fetch<'w>;
 
     /// # Safety
@@ -69,6 +73,7 @@ unsafe impl<T: Send + Sync + 'static> WorldQuery for &T {
         state: &ComponentId,
         desc: &QueryDesc,
         chunk: &Chunk<'w>,
+        _: Tick,
     ) -> *const T {
         let term = desc.read.iter().position(|c| c == state).unwrap();
         chunk
@@ -86,10 +91,17 @@ unsafe impl<T: Send + Sync + 'static> WorldQuery for &T {
 
 unsafe impl<T: Send + Sync + 'static> ReadOnlyWorldQuery for &T {}
 
+/// Per-chunk state for fetching `&mut T` as [`Mut<T>`].
+pub struct MutFetch<'w, T> {
+    ptr: *mut T,
+    ticks: &'w [TickCell],
+    this_run: Tick,
+}
+
 unsafe impl<T: Send + Sync + 'static> WorldQuery for &mut T {
     type State = ComponentId;
-    type Fetch<'w> = *mut T;
-    type Item<'w> = &'w mut T;
+    type Fetch<'w> = MutFetch<'w, T>;
+    type Item<'w> = Mut<'w, T>;
 
     fn init_state(world: &mut World) -> ComponentId {
         world.component_id::<T>()
@@ -103,17 +115,26 @@ unsafe impl<T: Send + Sync + 'static> WorldQuery for &mut T {
         state: &ComponentId,
         desc: &QueryDesc,
         chunk: &Chunk<'w>,
-    ) -> *mut T {
+        this_run: Tick,
+    ) -> MutFetch<'w, T> {
         let pos = desc.write.iter().position(|c| c == state).unwrap();
-        chunk
-            .ptr(desc.read.len() + pos)
-            .expect("required term")
-            .cast::<T>()
+        let term = desc.read.len() + pos;
+        let column = chunk.column(term).expect("required term");
+        MutFetch {
+            ptr: chunk.ptr(term).expect("required term").cast::<T>(),
+            ticks: &column.changed_cells()[chunk.rows()],
+            this_run,
+        }
     }
 
-    unsafe fn fetch<'w>(fetch: &mut *mut T, row: usize) -> &'w mut T {
+    unsafe fn fetch<'w>(
+        fetch: &mut <Self as WorldQuery>::Fetch<'w>,
+        row: usize,
+    ) -> <Self as WorldQuery>::Item<'w> {
+        let ticks: &'w [TickCell] = fetch.ticks;
         // SAFETY: per the trait contract the row is in bounds and unique.
-        unsafe { &mut *fetch.add(row) }
+        let value = unsafe { &mut *fetch.ptr.add(row) };
+        Mut::new(value, &ticks[row], fetch.this_run)
     }
 }
 
@@ -134,6 +155,7 @@ unsafe impl<T: Send + Sync + 'static> WorldQuery for Option<&T> {
         state: &ComponentId,
         desc: &QueryDesc,
         chunk: &Chunk<'w>,
+        _: Tick,
     ) -> Option<*const T> {
         let pos = desc.optional.iter().position(|c| c == state).unwrap();
         let term = desc.read.len() + desc.write.len() + pos;
@@ -164,6 +186,7 @@ unsafe impl WorldQuery for Entity {
         _: &(),
         _: &QueryDesc,
         chunk: &Chunk<'w>,
+        _: Tick,
     ) -> &'w [Entity] {
         chunk.entities()
     }
@@ -199,10 +222,11 @@ macro_rules! impl_world_query_tuple {
                 state: &Self::State,
                 desc: &QueryDesc,
                 chunk: &Chunk<'w>,
+                this_run: Tick,
             ) -> Self::Fetch<'w> {
                 let ($($t,)*) = state;
                 // SAFETY: forwarded contract.
-                ($(unsafe { $T::init_fetch($t, desc, chunk) },)*)
+                ($(unsafe { $T::init_fetch($t, desc, chunk, this_run) },)*)
             }
 
             unsafe fn fetch<'w>(
@@ -334,16 +358,17 @@ pub struct Query<'w, 's, D: WorldQuery, F: QueryFilter = ()> {
     world: WorldCell<'w>,
     state: &'s QueryParamState<D, F>,
     last_run: Tick,
+    this_run: Tick,
 }
 
 impl<D: WorldQuery, F: QueryFilter> Query<'_, '_, D, F> {
-    fn make_iter(&self, stamp: bool) -> QueryIter<'_, D, F> {
+    fn make_iter(&self) -> QueryIter<'_, D, F> {
         QueryIter {
             world: self.world,
             state: self.state,
             cursor: Cursor::default(),
             last_run: self.last_run,
-            stamp,
+            this_run: self.this_run,
             fetch: None,
             row: 0,
             len: 0,
@@ -351,12 +376,8 @@ impl<D: WorldQuery, F: QueryFilter> Query<'_, '_, D, F> {
     }
 
     /// # Safety
-    /// Stamping (`stamp`) requires the exclusive access `iter_mut` has.
-    unsafe fn get_inner(
-        &self,
-        entity: Entity,
-        stamp: bool,
-    ) -> Option<D::Item<'_>> {
+    /// For queries with write terms the caller needs exclusive access.
+    unsafe fn get_inner(&self, entity: Entity) -> Option<D::Item<'_>> {
         // SAFETY: the entity allocator is only read during a system run.
         let loc = unsafe { self.world.entities() }.location(entity)?;
         // SAFETY: the query is up to date, and the caller's access is
@@ -364,7 +385,7 @@ impl<D: WorldQuery, F: QueryFilter> Query<'_, '_, D, F> {
         let chunk = unsafe {
             self.state
                 .query
-                .chunk_at(self.world, loc, self.last_run, stamp)
+                .chunk_at(self.world, loc, self.last_run, false)
         }?;
         // SAFETY: the chunk comes from this query; row 0 of a 1-row chunk.
         unsafe {
@@ -372,20 +393,22 @@ impl<D: WorldQuery, F: QueryFilter> Query<'_, '_, D, F> {
                 &self.state.fetch,
                 self.state.query.desc(),
                 &chunk,
+                self.this_run,
             );
             Some(D::fetch(&mut fetch, 0))
         }
     }
 
-    /// Mutable iteration. Write columns are stamped changed.
+    /// Mutable iteration. Components are marked changed when written through
+    /// their [`Mut`], not when merely visited.
     pub fn iter_mut(&mut self) -> QueryIter<'_, D, F> {
-        self.make_iter(true)
+        self.make_iter()
     }
 
     /// The item for `entity`, if it is alive and matches.
     pub fn get_mut(&mut self, entity: Entity) -> Option<D::Item<'_>> {
         // SAFETY: `&mut self` is exclusive over this query's access.
-        unsafe { self.get_inner(entity, true) }
+        unsafe { self.get_inner(entity) }
     }
 
     /// Whether `entity` matches the query.
@@ -407,12 +430,12 @@ impl<D: WorldQuery, F: QueryFilter> Query<'_, '_, D, F> {
 
 impl<D: ReadOnlyWorldQuery, F: QueryFilter> Query<'_, '_, D, F> {
     pub fn iter(&self) -> QueryIter<'_, D, F> {
-        self.make_iter(false)
+        self.make_iter()
     }
 
     pub fn get(&self, entity: Entity) -> Option<D::Item<'_>> {
         // SAFETY: read-only query, nothing is stamped.
-        unsafe { self.get_inner(entity, false) }
+        unsafe { self.get_inner(entity) }
     }
 }
 
@@ -444,7 +467,7 @@ pub struct QueryIter<'a, D: WorldQuery, F: QueryFilter> {
     state: &'a QueryParamState<D, F>,
     cursor: Cursor,
     last_run: Tick,
-    stamp: bool,
+    this_run: Tick,
     fetch: Option<D::Fetch<'a>>,
     row: usize,
     len: usize,
@@ -470,7 +493,7 @@ impl<'a, D: WorldQuery, F: QueryFilter> Iterator for QueryIter<'a, D, F> {
                     self.world,
                     &mut self.cursor,
                     self.last_run,
-                    self.stamp,
+                    false,
                 )
             }?;
             self.len = chunk.len();
@@ -481,6 +504,7 @@ impl<'a, D: WorldQuery, F: QueryFilter> Iterator for QueryIter<'a, D, F> {
                     &self.state.fetch,
                     self.state.query.desc(),
                     &chunk,
+                    self.this_run,
                 )
             });
         }
@@ -513,6 +537,7 @@ unsafe impl<D: WorldQuery + 'static, F: QueryFilter + 'static> SystemParam
             world,
             state,
             last_run,
+            this_run: world.change_tick(),
         }
     }
 }

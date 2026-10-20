@@ -57,7 +57,7 @@ fn tuple_order_and_mutation() {
         mut q: Query<(&mut Position, &Velocity), Without<Frozen>>,
         mut stats: ResMut<Stats>,
     ) {
-        for (p, v) in &mut q {
+        for (mut p, v) in &mut q {
             p.0 += v.0 * time.dt;
             p.1 += v.1 * time.dt;
             stats.moved += 1;
@@ -140,7 +140,7 @@ fn change_detection_filters() {
         stats.seen_changed += changed.iter().count();
     }
     fn write(mut q: Query<&mut Position, With<Player>>) {
-        for p in &mut q {
+        for mut p in &mut q {
             p.0 += 1.0;
         }
     }
@@ -256,7 +256,7 @@ fn sample_game() {
         }
     }
     fn movement(time: Res<Time>, mut q: Query<(&mut Position, &Velocity)>) {
-        for (p, v) in &mut q {
+        for (mut p, v) in &mut q {
             p.0 += v.0 * time.dt;
             p.1 += v.1 * time.dt;
         }
@@ -266,7 +266,7 @@ fn sample_game() {
         mut q: Query<(Entity, &mut Lifetime)>,
         mut score: ResMut<Score>,
     ) {
-        for (e, life) in &mut q {
+        for (e, mut life) in &mut q {
             life.0 -= 1;
             if life.0 == 0 {
                 commands.despawn(e);
@@ -275,7 +275,7 @@ fn sample_game() {
         }
     }
     fn damage_low_health(mut q: Query<&mut Health, Without<Player>>) {
-        for h in &mut q {
+        for mut h in &mut q {
             h.0 -= 1;
         }
     }
@@ -309,4 +309,46 @@ fn sample_game() {
     assert!((1..=3).contains(&alive), "alive {alive}");
     // The hero (a Player) is untouched by `damage_low_health`.
     assert_eq!(world.get::<Health>(hero), Some(&Health(100)));
+}
+
+#[test]
+fn mut_marks_changed_only_when_written_through() {
+    struct Write(bool);
+
+    fn touch(mut q: Query<&mut Health>, write: Res<Write>) {
+        for mut h in &mut q {
+            if write.0 {
+                h.0 += 1; // DerefMut: marks changed
+            } else {
+                let _ = h.0; // Deref only: must not
+            }
+        }
+    }
+    fn watch(q: Query<Entity, Changed<Health>>, mut stats: ResMut<Stats>) {
+        stats.seen_changed += q.iter().count();
+    }
+
+    let mut world = World::new();
+    world.insert_resource(Stats::default());
+    world.insert_resource(Write(false));
+    let e = world.spawn();
+    world.insert(e, Health(0)).unwrap();
+
+    let mut schedule = Schedule::new();
+    schedule.add_system(Stage::PreUpdate, watch);
+    schedule.add_system(Stage::Update, touch);
+
+    let seen = |w: &World| w.resource::<Stats>().unwrap().seen_changed;
+    schedule.run(&mut world); // watch sees the insert
+    assert_eq!(seen(&world), 1);
+    schedule.run(&mut world);
+    schedule.run(&mut world); // touch only read
+    assert_eq!(seen(&world), 1);
+
+    world.resource_mut::<Write>().unwrap().0 = true;
+    schedule.run(&mut world); // touch writes...
+    assert_eq!(seen(&world), 1);
+    schedule.run(&mut world); // ...watch sees it one frame later
+    assert_eq!(seen(&world), 2);
+    assert_eq!(world.get::<Health>(e), Some(&Health(2)));
 }

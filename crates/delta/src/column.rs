@@ -2,7 +2,7 @@ use std::{alloc::Layout, ops::Range};
 
 use crate::{
     blob_vec::{BlobVec, DropFn},
-    tick::Tick,
+    tick::{Tick, TickCell},
 };
 
 /// One component's values for every row of an archetype, plus per-row ticks.
@@ -10,7 +10,7 @@ use crate::{
 pub struct Column {
     data: BlobVec,
     added: Vec<Tick>,
-    changed: Vec<Tick>,
+    changed: Vec<TickCell>,
 }
 
 impl Column {
@@ -43,7 +43,7 @@ impl Column {
         // SAFETY: forwarded contract.
         unsafe { self.data.push(src) };
         self.added.push(tick);
-        self.changed.push(tick);
+        self.changed.push(TickCell::new(tick));
     }
 
     /// Moves row `row` of `src` onto the end of this column, keeping its
@@ -57,7 +57,7 @@ impl Column {
         // SAFETY: same layout; src row is valid and in a different buffer.
         unsafe { self.data.push(src.data.get_ptr(row)) };
         self.added.push(src.added[row]);
-        self.changed.push(src.changed[row]);
+        self.changed.push(TickCell::new(src.changed(row)));
     }
 
     pub fn get_ptr(&self, row: usize) -> *mut u8 {
@@ -69,7 +69,28 @@ impl Column {
     }
 
     pub fn changed(&self, row: usize) -> Tick {
-        self.changed[row]
+        // SAFETY: writes only happen through `&mut self` methods or through
+        // `Mut`, whose access is exclusive per the system access sets.
+        unsafe { self.changed[row].read() }
+    }
+
+    /// The cell a `Mut` stamps when it is written through.
+    pub fn changed_cell(&self, row: usize) -> &TickCell {
+        &self.changed[row]
+    }
+
+    pub fn changed_cells(&self) -> &[TickCell] {
+        &self.changed
+    }
+
+    /// Clamps every stored tick that is too old at `now`.
+    pub fn check_ticks(&mut self, now: Tick) {
+        for tick in &mut self.added {
+            tick.check_tick(now);
+        }
+        for cell in &mut self.changed {
+            cell.get_mut().check_tick(now);
+        }
     }
 
     /// Overwrites a row, dropping the old value, and stamps `changed`.
@@ -79,16 +100,18 @@ impl Column {
     pub unsafe fn replace(&mut self, row: usize, src: *const u8, tick: Tick) {
         // SAFETY: forwarded contract.
         unsafe { self.data.replace(row, src) };
-        self.changed[row] = tick;
+        self.changed[row].set_mut(tick);
     }
 
     pub fn set_changed(&mut self, row: usize, tick: Tick) {
-        self.changed[row] = tick;
+        self.changed[row].set_mut(tick);
     }
 
     /// Stamps `changed` for a whole row range at once.
     pub fn set_changed_range(&mut self, rows: Range<usize>, tick: Tick) {
-        self.changed[rows].fill(tick);
+        for cell in &mut self.changed[rows] {
+            cell.set_mut(tick);
+        }
     }
 
     pub fn swap_remove_and_drop(&mut self, row: usize) {

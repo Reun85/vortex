@@ -113,15 +113,20 @@ struct Match {
 }
 
 impl Match {
-    fn row_passes(&self, arch: &Archetype, row: usize, last_run: Tick) -> bool {
+    fn row_passes(
+        &self,
+        arch: &Archetype,
+        row: usize,
+        last_run: Tick,
+        this_run: Tick,
+    ) -> bool {
         let cols = arch.columns();
         self.added
             .iter()
-            .all(|&i| cols[i].added(row).is_newer_than(last_run))
-            && self
-                .changed
-                .iter()
-                .all(|&i| cols[i].changed(row).is_newer_than(last_run))
+            .all(|&i| cols[i].added(row).is_newer_than(last_run, this_run))
+            && self.changed.iter().all(|&i| {
+                cols[i].changed(row).is_newer_than(last_run, this_run)
+            })
     }
 
     fn has_row_filters(&self) -> bool {
@@ -134,14 +139,16 @@ impl Match {
         arch: &Archetype,
         start: usize,
         last_run: Tick,
+        this_run: Tick,
     ) -> Option<Range<usize>> {
         let n = arch.len();
         if !self.has_row_filters() {
             return (start == 0 && n > 0).then_some(0..n);
         }
-        let first = (start..n).find(|&r| self.row_passes(arch, r, last_run))?;
+        let first = (start..n)
+            .find(|&r| self.row_passes(arch, r, last_run, this_run))?;
         let mut end = first + 1;
-        while end < n && self.row_passes(arch, end, last_run) {
+        while end < n && self.row_passes(arch, end, last_run, this_run) {
             end += 1;
         }
         Some(first..end)
@@ -305,7 +312,9 @@ impl QueryState {
         while let Some(m) = self.matched.get(cursor.matched) {
             // SAFETY: per contract.
             let arch = unsafe { world.archetypes() }.get(m.archetype);
-            if let Some(rows) = m.next_run(arch, cursor.row, last_run) {
+            if let Some(rows) =
+                m.next_run(arch, cursor.row, last_run, world.change_tick())
+            {
                 cursor.row = rows.end;
                 // SAFETY: per contract.
                 return Some(unsafe { self.chunk(world, m, rows, stamp) });
@@ -334,7 +343,7 @@ impl QueryState {
         let m = &self.matched[i];
         // SAFETY: per contract.
         let arch = unsafe { world.archetypes() }.get(m.archetype);
-        if !m.row_passes(arch, loc.row, last_run) {
+        if !m.row_passes(arch, loc.row, last_run, world.change_tick()) {
             return None;
         }
         // SAFETY: per contract.

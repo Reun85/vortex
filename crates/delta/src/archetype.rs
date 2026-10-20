@@ -181,6 +181,10 @@ impl Archetypes {
         &mut self.archetypes[id.index()]
     }
 
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Archetype> {
+        self.archetypes.iter_mut()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &Archetype> {
         self.archetypes.iter()
     }

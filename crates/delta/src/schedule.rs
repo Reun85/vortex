@@ -79,6 +79,11 @@ impl Schedule {
                 self.run_stage(stage, world);
             }
         }
+        if let Some(now) = world.check_change_ticks() {
+            for system in self.stages.iter_mut().flatten() {
+                system.check_change_tick(now);
+            }
+        }
     }
 
     /// Runs a single stage followed by its sync point.
@@ -91,5 +96,34 @@ impl Schedule {
         for system in systems.iter_mut() {
             system.apply_deferred(world);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tick::{CHECK_TICK_THRESHOLD, MAX_CHANGE_AGE, Tick};
+
+    struct A;
+
+    #[test]
+    fn frame_clamps_world_ticks_when_due() {
+        fn noop() {}
+        let mut world = World::new();
+        let e = world.spawn();
+        world.insert(e, A).unwrap();
+        let mut schedule = Schedule::new();
+        schedule.add_system(Stage::Update, noop);
+
+        // Jump far enough that the write at tick 1 is stale and a check is due.
+        let far = 1 + MAX_CHANGE_AGE.max(CHECK_TICK_THRESHOLD) + 10;
+        world.set_change_tick(Tick::new(far));
+        schedule.run(&mut world);
+
+        let now = world.change_tick();
+        let c = world.components().id_of::<A>().unwrap();
+        let loc = world.location(e).unwrap();
+        let col = world.archetypes().get(loc.archetype).column(c).unwrap();
+        assert_eq!(now.relative_to(col.changed(loc.row)).get(), MAX_CHANGE_AGE);
     }
 }

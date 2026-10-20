@@ -9,9 +9,10 @@ use std::{
 
 use crate::{
     archetype::{ArchetypeId, Archetypes},
+    change::Mut,
     component::{ComponentId, Components, Storage},
     entity::{Entities, Entity, EntityLocation},
-    tick::Tick,
+    tick::{CHECK_TICK_THRESHOLD, Tick},
 };
 
 /// The operation targeted an entity that is not alive.
@@ -33,6 +34,7 @@ pub struct World {
     archetypes: Archetypes,
     change_tick: Tick,
     resources: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    last_check_tick: Tick,
 }
 
 impl Default for World {
@@ -51,6 +53,7 @@ impl World {
             archetypes,
             change_tick: Tick::new(1),
             resources: HashMap::new(),
+            last_check_tick: Tick::new(1),
         }
     }
 
@@ -89,6 +92,11 @@ impl World {
 
     pub fn change_tick(&self) -> Tick {
         self.change_tick
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_change_tick(&mut self, tick: Tick) {
+        self.change_tick = tick;
     }
 
     /// Advances the global change tick (once per system run) and returns it.
@@ -252,16 +260,38 @@ impl World {
         self.get_by_id(e, c).map(|p| unsafe { &*p.cast::<T>() })
     }
 
-    /// Mutable access; stamps the component's `changed` tick.
-    pub fn get_mut<T: 'static>(&mut self, e: Entity) -> Option<&mut T> {
+    /// Mutable access. The component is marked changed when written through
+    /// the returned [`Mut`], not when merely fetched.
+    pub fn get_mut<T: 'static>(&mut self, e: Entity) -> Option<Mut<'_, T>> {
         let c = self.components.id_of::<T>()?;
         let loc = self.entities.location(e)?;
-        let tick = self.change_tick;
-        let col = self.archetypes.get_mut(loc.archetype).column_mut(c)?;
-        col.set_changed(loc.row, tick);
+        let this_run = self.change_tick;
+        let col = self.archetypes.get_mut(loc.archetype).column(c)?;
         // SAFETY: the column for `c` stores initialized `T`s, and `&mut self`
-        // guarantees exclusive access.
-        Some(unsafe { &mut *col.get_ptr(loc.row).cast::<T>() })
+        // guarantees exclusive access to the row and its tick.
+        let value = unsafe { &mut *col.get_ptr(loc.row).cast::<T>() };
+        Some(Mut::new(value, col.changed_cell(loc.row), this_run))
+    }
+
+    /// Clamps every stored tick that has grown too old, once per
+    /// [`CHECK_TICK_THRESHOLD`] ticks. Returns the tick it clamped against
+    /// when it ran, so the caller can clamp the systems' `last_run` too.
+    ///
+    /// Must be called regularly (the schedule does so once per frame): a
+    /// tick left unchecked for about half the `u32` range would otherwise
+    /// start comparing as newer than it is.
+    pub fn check_change_ticks(&mut self) -> Option<Tick> {
+        let now = self.change_tick;
+        if now.relative_to(self.last_check_tick).get() < CHECK_TICK_THRESHOLD {
+            return None;
+        }
+        for arch in self.archetypes.iter_mut() {
+            for col in arch.columns_mut() {
+                col.check_ticks(now);
+            }
+        }
+        self.last_check_tick = now;
+        Some(now)
     }
 
     /// Moves `e` from `loc`'s archetype to `to`. Columns shared by both are
@@ -441,6 +471,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::tick::MAX_CHANGE_AGE;
 
     #[derive(Debug, Clone, Copy, PartialEq)]
     struct A(u32);
@@ -471,6 +502,126 @@ mod tests {
         assert_eq!(w.despawn(e), Err(DeadEntity(e)));
         assert_eq!(w.insert(e, A(3)), Err(DeadEntity(e)));
         w.validate();
+    }
+
+    fn changed_since(w: &World, last_run: Tick) -> usize {
+        use crate::query::{QueryDesc, QueryState};
+        let c = w.components().id_of::<A>().unwrap();
+        let mut q = QueryState::new(QueryDesc {
+            changed: vec![c],
+            ..Default::default()
+        });
+        let mut n = 0;
+        q.for_each_chunk(w, last_run, |chunk| n += chunk.len());
+        n
+    }
+
+    /// Advances the tick like a long-running game, `steps` thresholds long.
+    fn run_ticks(w: &mut World, steps: u32, check: bool) {
+        for _ in 0..steps {
+            let t = w.change_tick().get().wrapping_add(CHECK_TICK_THRESHOLD);
+            w.set_change_tick(Tick::new(t));
+            if check {
+                w.check_change_ticks();
+            }
+        }
+    }
+
+    #[test]
+    fn check_runs_only_once_per_threshold() {
+        let mut w = World::new();
+        assert_eq!(w.check_change_ticks(), None);
+        w.set_change_tick(Tick::new(1 + CHECK_TICK_THRESHOLD - 1));
+        assert_eq!(w.check_change_ticks(), None);
+        w.set_change_tick(Tick::new(1 + CHECK_TICK_THRESHOLD));
+        assert_eq!(w.check_change_ticks(), Some(w.change_tick()));
+        assert_eq!(w.check_change_ticks(), None);
+    }
+
+    /// Advances the world by exactly 2^32 + 3 ticks, the point where an
+    /// unchecked tick written at tick 1 aliases to "3 ticks ago".
+    fn advance_to_alias_point(w: &mut World, check: bool) {
+        run_ticks(w, 8, check);
+        let extra = (1u64 << 32) + 3 - 8 * u64::from(CHECK_TICK_THRESHOLD);
+        let t = w.change_tick().get().wrapping_add(extra as u32);
+        w.set_change_tick(Tick::new(t));
+        if check {
+            w.check_change_ticks();
+        }
+    }
+
+    #[test]
+    fn stale_ticks_are_clamped_not_resurrected() {
+        let mut w = World::new();
+        let e = w.spawn();
+        w.insert(e, A(0)).unwrap(); // stamped at tick 1
+        advance_to_alias_point(&mut w, true);
+        let now = w.change_tick();
+        assert_eq!(now, Tick::new(4), "the counter wrapped");
+
+        // The stored tick was clamped to about the maximum age.
+        let c = w.components().id_of::<A>().unwrap();
+        let loc = w.location(e).unwrap();
+        let col = w.archetypes().get(loc.archetype).column(c).unwrap();
+        let age = now.relative_to(col.changed(loc.row)).get();
+        assert!(
+            (MAX_CHANGE_AGE..=MAX_CHANGE_AGE + CHECK_TICK_THRESHOLD)
+                .contains(&age)
+        );
+
+        // A system that ran 5 ticks ago does not see that write as new...
+        let last_run = Tick::new(now.get().wrapping_sub(5));
+        assert_eq!(changed_since(&w, last_run), 0);
+        // ...but a fresh write is still detected.
+        w.get_mut::<A>(e).unwrap().0 = 1;
+        assert_eq!(changed_since(&w, last_run), 1);
+    }
+
+    #[test]
+    fn without_checks_old_ticks_alias_to_recent_ones() {
+        // The negative control: skipping the checks lets the same stale
+        // write look 3 ticks old once the counter has wrapped all the way
+        // around. This is the bug `check_change_ticks` exists to prevent.
+        let mut w = World::new();
+        let e = w.spawn();
+        w.insert(e, A(0)).unwrap();
+        advance_to_alias_point(&mut w, false);
+        let last_run = Tick::new(w.change_tick().get().wrapping_sub(5));
+        assert_eq!(changed_since(&w, last_run), 1, "false positive");
+    }
+
+    #[test]
+    fn detection_works_across_wraparound() {
+        let mut w = World::new();
+        w.set_change_tick(Tick::new(u32::MAX - 2));
+        let e = w.spawn();
+        w.insert(e, A(0)).unwrap(); // stamped u32::MAX - 2
+        let last_run = w.change_tick();
+        for _ in 0..5 {
+            w.increment_change_tick(); // wraps past u32::MAX
+        }
+        assert!(w.change_tick().get() < 10);
+        assert_eq!(changed_since(&w, last_run), 0);
+        w.get_mut::<A>(e).unwrap().0 = 9; // stamped after the wrap
+        assert_eq!(changed_since(&w, last_run), 1);
+    }
+
+    #[test]
+    fn mut_only_marks_changed_when_written() {
+        let mut w = World::new();
+        let e = w.spawn();
+        w.insert(e, A(0)).unwrap();
+        let last_run = w.change_tick();
+        w.increment_change_tick();
+        {
+            let a = w.get_mut::<A>(e).unwrap();
+            let _read = a.0; // Deref only
+        }
+        assert_eq!(changed_since(&w, last_run), 0);
+        w.get_mut::<A>(e).unwrap().0 += 1; // DerefMut
+        assert_eq!(changed_since(&w, last_run), 1);
+        w.get_mut::<A>(e).unwrap().bypass_change_detection().0 += 1;
+        assert_eq!(w.get::<A>(e), Some(&A(2)));
     }
 
     #[test]
