@@ -45,19 +45,23 @@ fn tracked_world() -> World {
     world.insert_resource(Log::default());
     world
         .register_hooks::<Tracked>()
-        .on_add(|mut w, e| {
+        .on_add(|mut w, cx| {
+            let e = cx.entity;
             let v = w.get::<Tracked>(e).unwrap().0;
             log(&mut w, format!("add {v}"));
         })
-        .on_insert(|mut w, e| {
+        .on_insert(|mut w, cx| {
+            let e = cx.entity;
             let v = w.get::<Tracked>(e).unwrap().0;
             log(&mut w, format!("insert {v}"));
         })
-        .on_replace(|mut w, e| {
+        .on_replace(|mut w, cx| {
+            let e = cx.entity;
             let v = w.get::<Tracked>(e).unwrap().0;
             log(&mut w, format!("replace {v}"));
         })
-        .on_remove(|mut w, e| {
+        .on_remove(|mut w, cx| {
+            let e = cx.entity;
             let v = w.get::<Tracked>(e).unwrap().0;
             log(&mut w, format!("remove {v}"));
         });
@@ -107,7 +111,8 @@ fn batched_inserts_are_all_in_place_before_on_add() {
     struct Needs;
     let mut world = World::new();
     world.insert_resource(Log::default());
-    world.register_hooks::<Needs>().on_add(|mut w, e| {
+    world.register_hooks::<Needs>().on_add(|mut w, cx| {
+        let e = cx.entity;
         let companion = w.has::<Companion>(e);
         log(&mut w, format!("needs sees companion: {companion}"));
     });
@@ -411,14 +416,16 @@ fn physics_stub_with_hooks_and_collision_observers() {
     // despawns the body and however they do it.
     world
         .register_hooks::<RigidBody>()
-        .on_add(|mut w, e| {
+        .on_add(|mut w, cx| {
+            let e = cx.entity;
             let mass = w.get::<RigidBody>(e).unwrap().mass;
             w.resource_mut::<PhysicsBackend>()
                 .unwrap()
                 .bodies
                 .insert(e, mass);
         })
-        .on_remove(|mut w, e| {
+        .on_remove(|mut w, cx| {
+            let e = cx.entity;
             let backend = w.resource_mut::<PhysicsBackend>().unwrap();
             backend.bodies.remove(&e);
             backend.removed += 1;

@@ -2,17 +2,25 @@ use std::fmt;
 
 use crate::{
     change::Mut,
-    commands::Commands,
-    component::Components,
+    commands::{CommandQueue, Commands},
+    component::{ComponentId, Components},
     entity::Entity,
     observer::Event,
     world::World,
 };
 
+/// What a hook is being run for. One function can serve many components
+/// (every script class shares the same hooks), so it needs to be told which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HookContext {
+    pub entity: Entity,
+    pub component: ComponentId,
+}
+
 /// A component lifecycle callback. It receives restricted world access:
 /// structural changes must go through [`DeferredWorld::commands`], and are
 /// applied before the current sync point ends.
-pub type Hook = fn(DeferredWorld<'_>, Entity);
+pub type Hook = fn(DeferredWorld<'_>, HookContext);
 
 /// Lifecycle hooks for one component type, owned by that component's author.
 ///
@@ -93,6 +101,19 @@ impl DeferredWorld<'_> {
 
     pub fn emit_global<E: Event>(&mut self, event: E) {
         self.commands().emit_global(event);
+    }
+
+    /// The world and its deferred buffer as raw pointers, for hosts that
+    /// call out to code which only has a world pointer (the script bridge).
+    ///
+    /// # Safety
+    /// The callee must treat the world as read-only plus in-place writes to
+    /// component values, and record every structural change (spawn, despawn,
+    /// insert, remove) in the returned queue, never apply it directly. Both
+    /// pointers are valid only until this `DeferredWorld` is used again.
+    pub unsafe fn raw_parts(&mut self) -> (*mut World, *mut CommandQueue) {
+        let queue: *mut CommandQueue = &raw mut self.world.deferred;
+        (&raw mut *self.world, queue)
     }
 }
 

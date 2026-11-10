@@ -726,6 +726,8 @@ mod tests {
             storage: Storage::Table,
             hooks: Default::default(),
             reflect: None,
+            requires: Box::default(),
+            external: None,
         })
     }
 

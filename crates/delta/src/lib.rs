@@ -9,6 +9,7 @@ pub mod change;
 pub mod column;
 pub mod commands;
 pub mod component;
+pub mod engine;
 pub mod entity;
 pub mod hooks;
 pub mod inspect;
@@ -28,10 +29,25 @@ pub use blob_vec::BlobVec;
 pub use change::Mut;
 pub use column::Column;
 pub use commands::{CommandQueue, Commands, EntityCommands};
-pub use component::{ComponentId, ComponentInfo, Components, Kind, Storage};
+pub use component::{
+    ComponentId,
+    ComponentInfo,
+    Components,
+    ExternalSerde,
+    Kind,
+    RETIRED_MARK,
+    Storage,
+};
 pub use delta_derive::Reflect;
+pub use engine::{AXES, InputMap, InputState, KEY_BITS, KeyCode, Time};
 pub use entity::{Entities, Entity, EntityLocation};
-pub use hooks::{ComponentHooks, DeferredWorld, Hook, HooksBuilder};
+pub use hooks::{
+    ComponentHooks,
+    DeferredWorld,
+    Hook,
+    HookContext,
+    HooksBuilder,
+};
 pub use inspect::{InspectError, ResolvedField, resolve_path};
 pub use message::{MessageReader, MessageWriter, Messages};
 pub use observer::{Event, EventHeader, EventId, Events, Observer, Trigger};
@@ -46,7 +62,7 @@ pub use reflect::{
     TypeReflect,
     TypeRegistry,
 };
-pub use scene::{LoadReport, SceneError, SceneId};
+pub use scene::{LoadReport, OwnedValue, SceneError, SceneId};
 pub use schedule::{Schedule, Stage};
 pub use system::{Access, IntoSystem, Local, Res, ResMut, System, SystemParam};
 pub use tick::{CHECK_TICK_THRESHOLD, MAX_CHANGE_AGE, Tick};

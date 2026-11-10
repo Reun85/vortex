@@ -34,6 +34,9 @@ public static unsafe class Bridge
             var hostApi = (HostApi*)host;
             if (hostApi->Version != Native.ApiVersion || hostApi->Size != (uint)sizeof(HostApi))
                 return 1;
+            // The two mirrors of FieldDescFfi must agree on size, or every field would be misread.
+            if (sizeof(FieldDescFfi) != Native.FieldDescSize)
+                return 2;
 
             Host.Api = (HostApi*)NativeMemory.Alloc((nuint)sizeof(HostApi));
             *Host.Api = *hostApi;
@@ -51,6 +54,15 @@ public static unsafe class Bridge
             api->SerializeBehaviour = &SerializeBehaviour;
             api->DeserializeBehaviour = &DeserializeBehaviour;
             api->TakeWarnings = &TakeWarnings;
+            api->BehaviourEvent = &BehaviourEvent;
+            api->BehaviourToJson = &BehaviourToJson;
+            api->BehaviourFromJson = &BehaviourFromJson;
+            api->BehaviourGetMember = &BehaviourGetMember;
+            api->BehaviourSetMember = &BehaviourSetMember;
+            api->BehaviourSchema = &BehaviourSchema;
+            api->BehaviourDefaultJson = &BehaviourDefaultJson;
+            api->BehaviourRemapEntity = &BehaviourRemapEntity;
+            api->TakeResult = &TakeResult;
             Host.Script = api;
             return 0;
         }
@@ -127,7 +139,7 @@ public static unsafe class Bridge
         {
             var behaviour = Scripts.Behaviour((nint)handle);
             if (behaviour is null) return nuint.MaxValue;
-            var bytes = BehaviourSerializer.Save(behaviour);
+            var bytes = BehaviourSerializer.Save(behaviour, SerializeMode.Snapshot);
             if ((nuint)bytes.Length <= capacity)
             {
                 bytes.AsSpan().CopyTo(new Span<byte>(buffer, bytes.Length));
@@ -150,7 +162,7 @@ public static unsafe class Bridge
         try
         {
             if (!Scripts.TryBehaviourType(component, out var type)) return 0;
-            var behaviour = BehaviourSerializer.Restore(type, new ReadOnlySpan<byte>(json, (int)len));
+            var behaviour = BehaviourSerializer.Restore(type, new ReadOnlySpan<byte>(json, (int)len), SerializeMode.Snapshot);
             Interlocked.Increment(ref LiveHandleCount);
             return (ulong)GCHandle.ToIntPtr(GCHandle.Alloc(behaviour, GCHandleType.Normal));
         }
@@ -159,6 +171,137 @@ public static unsafe class Bridge
             Warn($"restoring a behaviour failed: {e.Message}");
             return 0;
         }
+    }
+
+    [UnmanagedCallersOnly]
+    static void BehaviourEvent(nint world, ulong handle, ulong entity, uint evt)
+    {
+        try { Scripts.Deliver(world, (nint)handle, new Entity(entity), evt); }
+        catch (Exception e) { Host.Log(3, $"behaviour event {evt} failed: {e}"); }
+    }
+
+    // ---- behaviours as editor data ------------------------------------------
+    // Each call stores its JSON result and returns the length (or
+    // nuint.MaxValue with the reason in lastError); the host then fetches it
+    // with TakeResult.
+
+    static byte[] result = [];
+
+    static nuint Store(byte[] bytes)
+    {
+        result = bytes;
+        return (nuint)bytes.Length;
+    }
+
+    static nuint Failed(Exception e)
+    {
+        lastError = e.Message;
+        return nuint.MaxValue;
+    }
+
+    [UnmanagedCallersOnly]
+    static nuint BehaviourToJson(nint world, ulong handle, uint mode)
+    {
+        try
+        {
+            World.Current = World.For(world);
+            var behaviour = Scripts.Behaviour((nint)handle) ?? throw new InvalidOperationException("no such behaviour");
+            return Store(BehaviourSerializer.Save(behaviour, (SerializeMode)mode));
+        }
+        catch (Exception e) { return Failed(e); }
+    }
+
+    [UnmanagedCallersOnly]
+    static ulong BehaviourFromJson(nint world, uint component, byte* json, nuint len)
+    {
+        try
+        {
+            World.Current = World.For(world);
+            if (!Scripts.TryBehaviourType(component, out var type))
+                throw new InvalidOperationException($"component {component} is not a behaviour class");
+            var behaviour = BehaviourSerializer.Restore(type, new ReadOnlySpan<byte>(json, (int)len), SerializeMode.Persist);
+            Interlocked.Increment(ref LiveHandleCount);
+            return (ulong)GCHandle.ToIntPtr(GCHandle.Alloc(behaviour, GCHandleType.Normal));
+        }
+        catch (Exception e)
+        {
+            lastError = e.Message;
+            return 0;
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    static nuint BehaviourGetMember(nint world, ulong handle, byte* path, nuint pathLen)
+    {
+        try
+        {
+            World.Current = World.For(world);
+            var behaviour = Scripts.Behaviour((nint)handle) ?? throw new InvalidOperationException("no such behaviour");
+            return Store(BehaviourSerializer.GetMember(behaviour, Encoding.UTF8.GetString(path, (int)pathLen)));
+        }
+        catch (Exception e) { return Failed(e); }
+    }
+
+    [UnmanagedCallersOnly]
+    static nuint BehaviourSetMember(nint world, ulong handle, byte* path, nuint pathLen, byte* json, nuint jsonLen)
+    {
+        try
+        {
+            World.Current = World.For(world);
+            var behaviour = Scripts.Behaviour((nint)handle) ?? throw new InvalidOperationException("no such behaviour");
+            return Store(BehaviourSerializer.SetMember(behaviour, Encoding.UTF8.GetString(path, (int)pathLen),
+                new ReadOnlySpan<byte>(json, (int)jsonLen)));
+        }
+        catch (Exception e) { return Failed(e); }
+    }
+
+    [UnmanagedCallersOnly]
+    static nuint BehaviourSchema(uint component)
+    {
+        try
+        {
+            if (!Scripts.TryBehaviourType(component, out var type))
+                throw new InvalidOperationException($"component {component} is not a behaviour class");
+            return Store(BehaviourSerializer.Schema(type));
+        }
+        catch (Exception e) { return Failed(e); }
+    }
+
+    [UnmanagedCallersOnly]
+    static nuint BehaviourDefaultJson(nint world, uint component)
+    {
+        try
+        {
+            World.Current = World.For(world);
+            if (!Scripts.TryBehaviourType(component, out var type))
+                throw new InvalidOperationException($"component {component} is not a behaviour class");
+            return Store(BehaviourSerializer.Default(type));
+        }
+        catch (Exception e) { return Failed(e); }
+    }
+
+    [UnmanagedCallersOnly]
+    static uint BehaviourRemapEntity(nint world, ulong handle, ulong from, ulong to)
+    {
+        try
+        {
+            World.Current = World.For(world);
+            var behaviour = Scripts.Behaviour((nint)handle);
+            return behaviour is null ? 0 : (uint)BehaviourSerializer.RemapEntities(behaviour, from, to);
+        }
+        catch (Exception e)
+        {
+            lastError = e.Message;
+            return 0;
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    static nuint TakeResult(byte* buffer, nuint capacity)
+    {
+        var n = (int)Math.Min((nuint)result.Length, capacity);
+        result.AsSpan(0, n).CopyTo(new Span<byte>(buffer, n));
+        return (nuint)n;
     }
 
     [UnmanagedCallersOnly]

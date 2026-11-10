@@ -10,7 +10,7 @@ use std::{collections::HashMap, fmt};
 use serde_json::Value;
 
 use crate::{
-    component::ComponentId,
+    component::{ComponentId, ExternalSerde},
     entity::Entity,
     reflect::{FieldType, ReflectId, TypeRegistry},
     scene::{WriteCtx, ZeroedBuf, read_value, write_value},
@@ -145,21 +145,73 @@ fn entity_offsets(
     }
 }
 
+/// How a component's value is read and written.
+enum Access {
+    Reflected(ReflectId),
+    External(ExternalSerde),
+}
+
 impl World {
-    fn reflected_component(
+    fn component_access(
         &self,
         name: &str,
-    ) -> Result<(ComponentId, ReflectId), InspectError> {
+    ) -> Result<(ComponentId, Access), InspectError> {
         let c = self
             .components
             .id_by_name(name)
             .ok_or_else(|| InspectError::UnknownComponent(name.to_owned()))?;
-        let reflect = self
-            .components
-            .info(c)
+        let info = self.components.info(c);
+        if let Some(external) = info.external {
+            return Ok((c, Access::External(external)));
+        }
+        let reflect = info
             .reflect
             .ok_or_else(|| InspectError::NotReflected(name.to_owned()))?;
-        Ok((c, reflect))
+        Ok((c, Access::Reflected(reflect)))
+    }
+
+    /// The members of a component that tools can show: for reflected data
+    /// the fields (with range, tooltip and flags); for script components
+    /// whatever the script declares. A JSON array of
+    /// `{name, type, range?, tooltip?, hidden, read_only}`.
+    pub fn component_schema(
+        &self,
+        component: &str,
+    ) -> Result<Value, InspectError> {
+        match self.component_access(component)? {
+            (c, Access::External(ext)) => Ok((ext.schema)(self, c)),
+            (_, Access::Reflected(r)) => {
+                let t = self.reflection.get(r);
+                Ok(Value::Array(
+                    t.fields
+                        .iter()
+                        .map(|f| {
+                            let mut m = serde_json::Map::new();
+                            m.insert("name".into(), Value::from(&*f.name));
+                            m.insert(
+                                "type".into(),
+                                Value::from(format!("{:?}", f.ty)),
+                            );
+                            if let Some((lo, hi)) = f.attrs.range {
+                                m.insert(
+                                    "range".into(),
+                                    Value::from(vec![lo, hi]),
+                                );
+                            }
+                            if let Some(tip) = &f.attrs.tooltip {
+                                m.insert("tooltip".into(), Value::from(&**tip));
+                            }
+                            m.insert("hidden".into(), f.attrs.hidden.into());
+                            m.insert(
+                                "read_only".into(),
+                                f.attrs.read_only.into(),
+                            );
+                            Value::Object(m)
+                        })
+                        .collect(),
+                ))
+            }
+        }
     }
 
     /// Pointer to the component's value on `e`.
@@ -196,7 +248,15 @@ impl World {
         component: &str,
         path: &str,
     ) -> Result<Value, InspectError> {
-        let (c, reflect) = self.reflected_component(component)?;
+        let (c, access) = self.component_access(component)?;
+        let reflect = match access {
+            Access::Reflected(r) => r,
+            Access::External(ext) => {
+                let base = self.component_ptr(e, c, component)?;
+                return (ext.get_path)(self, base, path)
+                    .map_err(InspectError::BadValue);
+            }
+        };
         let field = resolve_path(&self.reflection, reflect, path)?;
         let base = self.component_ptr(e, c, component)?;
         // SAFETY: the resolved offset lies inside the component's value.
@@ -217,7 +277,26 @@ impl World {
         path: &str,
         value: &Value,
     ) -> Result<Value, InspectError> {
-        let (c, reflect) = self.reflected_component(component)?;
+        let (c, access) = self.component_access(component)?;
+        let reflect = match access {
+            Access::Reflected(r) => r,
+            Access::External(ext) => {
+                // The live object is edited in place; only the change tick
+                // is ours to stamp.
+                let base = self.component_ptr(e, c, component)?;
+                let old = (ext.set_path)(self, base, path, value)
+                    .map_err(InspectError::BadValue)?;
+                let loc =
+                    self.location(e).ok_or(InspectError::DeadEntity(e))?;
+                let tick = self.change_tick;
+                if let Some(column) =
+                    self.archetypes.get_mut(loc.archetype).column_mut(c)
+                {
+                    column.set_changed(loc.row, tick);
+                }
+                return Ok(old);
+            }
+        };
         let field = resolve_path(&self.reflection, reflect, path)?;
         let old = self.field_value(e, component, path)?;
         let size = field.ty.size(&self.reflection);
@@ -276,7 +355,7 @@ impl World {
         e: Entity,
         component: &str,
     ) -> Result<crate::tick::Tick, InspectError> {
-        let (c, _) = self.reflected_component(component)?;
+        let (c, _) = self.component_access(component)?;
         let loc = self.location(e).ok_or(InspectError::DeadEntity(e))?;
         self.archetypes
             .get(loc.archetype)
@@ -301,7 +380,11 @@ impl World {
         &self,
         component: &str,
     ) -> Result<Value, InspectError> {
-        let (c, reflect) = self.reflected_component(component)?;
+        let (c, access) = self.component_access(component)?;
+        let reflect = match access {
+            Access::Reflected(r) => r,
+            Access::External(ext) => return Ok((ext.default_json)(self, c)),
+        };
         let buffer = ZeroedBuf::new(self.components.info(c).layout);
         Ok(read_value(
             &self.reflection,
@@ -319,7 +402,24 @@ impl World {
         component: &str,
         value: &Value,
     ) -> Result<(), InspectError> {
-        let (c, reflect) = self.reflected_component(component)?;
+        let (c, access) = self.component_access(component)?;
+        let reflect = match access {
+            Access::Reflected(r) => r,
+            Access::External(ext) => {
+                let owned = (ext.from_json)(self, c, value)
+                    .map_err(InspectError::BadValue)?;
+                // SAFETY: `owned` holds a value of the component's layout;
+                // on success the world owns it, on failure `owned` drops it.
+                return match unsafe { self.insert_by_id(e, c, owned.as_ptr()) }
+                {
+                    Ok(()) => {
+                        owned.inserted();
+                        Ok(())
+                    }
+                    Err(_) => Err(InspectError::DeadEntity(e)),
+                };
+            }
+        };
         let buffer = ZeroedBuf::new(self.components.info(c).layout);
         let mut warnings = Vec::new();
         let mut ctx = WriteCtx {
@@ -366,7 +466,7 @@ impl World {
             .components()
             .iter()
             .map(|&c| self.components.info(c))
-            .filter(|i| i.reflect.is_some())
+            .filter(|i| i.reflect.is_some() || i.external.is_some())
             .map(|i| i.name.to_string())
             .collect();
         names.sort();
@@ -430,6 +530,39 @@ impl World {
                         column.set_changed(row, tick);
                     }
                 }
+            }
+        }
+        rewritten + self.remap_external_references(from, to)
+    }
+
+    /// The script-owned part of [`remap_entity_references`]: each script
+    /// component rewrites the references inside its own objects.
+    fn remap_external_references(&mut self, from: Entity, to: Entity) -> usize {
+        let tick = self.change_tick;
+        let mut touched: Vec<(usize, ComponentId, usize)> = Vec::new();
+        let mut rewritten = 0;
+        for (a, arch) in self.archetypes.iter().enumerate() {
+            for (&c, column) in
+                arch.components().iter().zip(arch.columns().iter())
+            {
+                let Some(ext) = self.components.info(c).external else {
+                    continue;
+                };
+                for row in 0..column.len() {
+                    let n =
+                        (ext.remap_entity)(self, column.get_ptr(row), from, to);
+                    if n > 0 {
+                        rewritten += n;
+                        touched.push((a, c, row));
+                    }
+                }
+            }
+        }
+        let ids: Vec<_> = self.archetypes.iter().map(|a| a.id()).collect();
+        for (a, c, row) in touched {
+            if let Some(column) = self.archetypes.get_mut(ids[a]).column_mut(c)
+            {
+                column.set_changed(row, tick);
             }
         }
         rewritten

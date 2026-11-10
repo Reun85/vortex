@@ -47,6 +47,31 @@ pub enum FieldType {
         stride: usize,
     },
     Struct(ReflectId),
+    /// A fieldless enum stored as its integer representation. Scene files
+    /// and the inspector show the variant name.
+    Enum {
+        repr: EnumRepr,
+        /// Variant names and their values, in declaration order.
+        variants: Box<[(Box<str>, u32)]>,
+    },
+}
+
+/// The integer type a fieldless enum is stored as (`#[repr(u8/u16/u32)]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnumRepr {
+    U8,
+    U16,
+    U32,
+}
+
+impl EnumRepr {
+    pub const fn size(self) -> usize {
+        match self {
+            Self::U8 => 1,
+            Self::U16 => 2,
+            Self::U32 => 4,
+        }
+    }
 }
 
 /// Editor hints attached to a field.
@@ -89,6 +114,8 @@ pub struct TypeReflect {
     pub size: usize,
     pub align: usize,
     pub fields: Box<[FieldReflect]>,
+    /// Marked `#[reflect(script)]`: scripts get a generated C# mirror.
+    pub script: bool,
 }
 
 impl TypeReflect {
@@ -158,6 +185,7 @@ impl TypeRegistry {
             size,
             align,
             fields: fields.into(),
+            script: false,
         });
         self.by_name.insert(name.into(), id);
         Ok(id)
@@ -180,11 +208,25 @@ impl TypeRegistry {
                 size,
                 align,
                 fields: fields.into(),
+                script: false,
             };
             return id;
         }
         self.register_dynamic(name, size, align, fields)
             .expect("a fresh name cannot conflict")
+    }
+
+    /// Marks a type as script-visible (see [`TypeReflect::script`]).
+    pub fn mark_script(&mut self, id: ReflectId) {
+        self.types[id.index()].script = true;
+    }
+
+    /// Every registered type, with its id.
+    pub fn iter(&self) -> impl Iterator<Item = (ReflectId, &TypeReflect)> {
+        self.types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (ReflectId(i as u32), t))
     }
 
     /// Registers `T`. Used by the derive; call [`Reflect::reflect_id`]
@@ -209,6 +251,7 @@ impl TypeRegistry {
             size,
             align,
             fields: fields.into(),
+            script: false,
         });
         self.by_name.insert(name.into(), id);
         self.by_type.insert(TypeId::of::<T>(), id);
@@ -265,6 +308,7 @@ impl FieldType {
             Self::I32 | Self::U32 | Self::F32 => 4,
             Self::I64 | Self::U64 | Self::F64 | Self::Entity => 8,
             Self::Array { len, stride, .. } => len * stride,
+            Self::Enum { repr, .. } => repr.size(),
             Self::Struct(id) => registry.get(*id).size,
         }
     }
@@ -305,6 +349,7 @@ pub fn types_equal(
         ) => {
             la == lb && sa == sb && types_equal(a_registry, ea, b_registry, eb)
         }
+        (FieldType::Enum { .. }, FieldType::Enum { .. }) => a == b,
         (FieldType::Struct(_), _)
         | (_, FieldType::Struct(_))
         | (FieldType::Array { .. }, _)

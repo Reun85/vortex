@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     entity::Entity,
-    hooks::DeferredWorld,
+    hooks::{DeferredWorld, HookContext},
     system::{Access, IntoSystem, System, SystemParam},
     tick::Tick,
     world::{World, WorldCell},
@@ -243,7 +243,8 @@ impl ObserverIndex {
     }
 }
 
-fn observer_added(world: DeferredWorld<'_>, e: Entity) {
+fn observer_added(world: DeferredWorld<'_>, cx: HookContext) {
+    let e = cx.entity;
     let (event, target) = {
         let o = world
             .get::<Observer>(e)
@@ -253,7 +254,8 @@ fn observer_added(world: DeferredWorld<'_>, e: Entity) {
     world.world.observers.insert(event, target, e);
 }
 
-fn observer_removed(world: DeferredWorld<'_>, e: Entity) {
+fn observer_removed(world: DeferredWorld<'_>, cx: HookContext) {
+    let e = cx.entity;
     let (event, target) = {
         let o = world
             .get::<Observer>(e)

@@ -1,5 +1,5 @@
-// One source, three "versions" of a game's scripts, selected with
-// -p:Variant=V1|V2|V3. The hot-reload test builds all three and reloads
+// One source, four "versions" of a game's scripts, selected with
+// -p:Variant=V1|V2|V3|V4. The hot-reload test builds them all and reloads
 // from one to the next while the world keeps running.
 //
 //   V1  the baseline.
@@ -7,6 +7,8 @@
 //       Armor added); Counter swaps a field; Goner is removed; adds a system
 //       that leaks (never undoes a static event subscription).
 //   V3  Goner returns.
+//   V4  V3, except Counter stops being a Behaviour and becomes a plain
+//       struct component: a reload must not reinterpret its columns.
 using System;
 using System.Collections.Generic;
 using Delta;
@@ -39,6 +41,8 @@ public sealed class Probe : ScriptSystem
     const int Version = 1;
 #elif V2
     const int Version = 2;
+#elif V4
+    const int Version = 4;
 #else
     const int Version = 3;
 #endif
@@ -66,6 +70,9 @@ public sealed class Probe : ScriptSystem
     }
 }
 
+#if V4
+public struct Counter : IComponent { public int Count; }
+#else
 public sealed class Counter : Behaviour
 {
     public int Count;
@@ -90,8 +97,9 @@ public sealed class Counter : Behaviour
 #endif
     }
 }
+#endif
 
-#if V1 || V3
+#if V1 || V3 || V4
 public sealed class Goner : Behaviour
 {
     public int Secret = 42;

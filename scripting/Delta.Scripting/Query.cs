@@ -25,6 +25,8 @@ public sealed unsafe class QueryBuilder
     /// <summary>Reads a Behaviour column (its handles); used by the behaviour dispatcher.</summary>
     internal QueryBuilder ReadRaw(uint component) { read.Add(component); return this; }
 
+    internal QueryBuilder AddedRaw(uint component) { added.Add(component); return this; }
+
     public Query Build()
     {
         fixed (uint* r = read.ToArray(), w = write.ToArray(), o = optional.ToArray(),
@@ -51,7 +53,7 @@ public sealed unsafe class QueryBuilder
 }
 
 /// <summary>A compiled query. Iterate it chunk by chunk with <c>foreach</c>.</summary>
-public sealed unsafe class Query
+public sealed unsafe class Query : IDisposable
 {
     internal readonly World World;
     internal readonly uint Id;
@@ -65,6 +67,20 @@ public sealed unsafe class Query
     }
 
     public ChunkEnumerator GetEnumerator() => new(this);
+
+    bool disposed;
+
+    /// <summary>
+    /// Releases the query's slot in the host. Queries are also freed when
+    /// their assembly unloads, so this matters only for short-lived queries.
+    /// Not a finalizer: it must not run on a thread of the runtime's choosing.
+    /// </summary>
+    public void Dispose()
+    {
+        if (disposed) return;
+        disposed = true;
+        Host.Api->QueryFree(World.Ptr, Id);
+    }
 
     /// <summary>The term index of a component among reads (<paramref name="write"/> false) or writes.</summary>
     internal int TermOf(uint component, bool write)

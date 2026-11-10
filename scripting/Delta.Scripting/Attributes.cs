@@ -38,3 +38,41 @@ public sealed class ExecutionOrderAttribute(int order) : Attribute
 {
     public int Order { get; } = order;
 }
+
+/// <summary>
+/// Components that must exist whenever this one is added. When missing they
+/// are inserted zero-initialized in the same step, before any
+/// <see cref="Behaviour.Awake"/> runs. Data components and tags only.
+/// </summary>
+[AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct)]
+public sealed class RequiresAttribute(params Type[] components) : Attribute
+{
+    public Type[] Components { get; } = components;
+}
+
+/// <summary>Saves a private field in scenes and shows it in the inspector.</summary>
+[AttributeUsage(AttributeTargets.Field)]
+public sealed class SerializeFieldAttribute : Attribute { }
+
+/// <summary>Limits a numeric field in the inspector.</summary>
+[AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+public sealed class RangeAttribute(double min, double max) : Attribute
+{
+    public double Min { get; } = min;
+    public double Max { get; } = max;
+}
+
+/// <summary>Help text shown next to a field in the inspector.</summary>
+[AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+public sealed class TooltipAttribute(string text) : Attribute
+{
+    public string Text { get; } = text;
+}
+
+/// <summary>Keeps a field out of the inspector.</summary>
+[AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+public sealed class HideInInspectorAttribute : Attribute { }
+
+/// <summary>Shows a field in the inspector but refuses edits.</summary>
+[AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+public sealed class ReadOnlyAttribute : Attribute { }

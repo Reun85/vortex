@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+delta = { path = "../delta" }
+vortex_engine = { path = "../vortex_engine" }
+
+[lints]
+workspace = true

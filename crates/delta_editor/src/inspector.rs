@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use delta::{SceneId, World};
 use serde_json::Value;
@@ -23,11 +23,18 @@ pub struct InspectorUpdate {
 /// of the previous refresh, the same mechanism `Changed<T>` filters use, so
 /// it is exact and costs one tick comparison per component, not a diff of
 /// values.
+///
+/// Script (managed) components are the exception: a script changes its own
+/// fields without stamping any tick, so those components of the one
+/// inspected entity are re-read on every refresh and reported as changed
+/// only when their JSON differs from the last read.
 #[derive(Default)]
 pub struct Inspector {
     target: Option<SceneId>,
     last_run: delta::Tick,
     known: BTreeSet<String>,
+    /// The last JSON seen of each script component.
+    managed: BTreeMap<String, Value>,
 }
 
 impl Inspector {
@@ -44,6 +51,7 @@ impl Inspector {
     pub fn set_target(&mut self, target: Option<SceneId>) {
         self.target = target;
         self.known.clear();
+        self.managed.clear();
         self.last_run = delta::Tick::new(0);
     }
 
@@ -65,8 +73,22 @@ impl Inspector {
         update.added = current.difference(&self.known).cloned().collect();
         update.removed = self.known.difference(&current).cloned().collect();
 
+        self.managed.retain(|name, _| current.contains(name));
         for name in &current {
             let is_new = update.added.contains(name);
+            let managed = world
+                .components()
+                .id_by_name(name)
+                .is_some_and(|c| world.components().info(c).external.is_some());
+            if managed {
+                if let Ok(value) = world.component_value(entity, name)
+                    && self.managed.get(name) != Some(&value)
+                {
+                    self.managed.insert(name.clone(), value.clone());
+                    update.changed.push((name.clone(), value));
+                }
+                continue;
+            }
             let written = world
                 .component_changed_tick(entity, name)
                 .is_ok_and(|t| t.is_newer_than(self.last_run, this_run));

@@ -36,6 +36,8 @@ internal sealed class LoadedScript
     public WeakReference ContextRef = null!;
     public readonly List<uint> SystemIds = [];
     public readonly List<Type> ComponentTypes = [];
+    /// <summary>Engine-resource mirrors this assembly declared and bound.</summary>
+    public readonly List<Type> MirrorTypes = [];
 }
 
 internal static unsafe class Scripts
@@ -58,7 +60,7 @@ internal static unsafe class Scripts
         && typeof(ScriptSystem).IsAssignableFrom(t) && t != typeof(BehaviourSystem);
 
     static bool Overrides(Type t, string method) =>
-        t.GetMethod(method, BindingFlags.Public | BindingFlags.Instance, Type.EmptyTypes)?.DeclaringType != typeof(Behaviour);
+        t.GetMethod(method, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, Type.EmptyTypes)?.DeclaringType != typeof(Behaviour);
 
     static void Register(nint world, LoadedScript script, string name, Stage stage, int order, ScriptSystem system)
     {
@@ -84,23 +86,53 @@ internal static unsafe class Scripts
         scriptId = script.Id;
         var assembly = context.LoadFromAssemblyPath(path);
         Loaded[script.Id] = script;
+        try
+        {
+            return LoadTypes(world, script, assembly);
+        }
+        catch
+        {
+            Unload(script.Id);
+            throw;
+        }
+    }
+
+    static int LoadTypes(nint world, LoadedScript script, Assembly assembly)
+    {
 
         Type[] types;
         try { types = assembly.GetTypes(); }
         catch (ReflectionTypeLoadException e) { types = [.. e.Types.Where(t => t is not null)!]; }
 
-        // Deterministic registration order, so component ids are stable run to run.
-        foreach (var t in types.Where(IsComponentStruct).OrderBy(ComponentRegistry.NameOf, StringComparer.Ordinal))
+        // Engine mirrors in this assembly (and, once, the bridge's own) must
+        // match Rust; check before anything is registered, so a bad mirror
+        // leaves nothing behind.
+        EngineBinding.Bind(world, types, script.MirrorTypes);
+
+        // Deterministic registration order, so component ids are stable run
+        // to run: structs by name, then behaviours by name. A type that
+        // requires another registers after it, wherever it sorts.
+        var registering = new HashSet<Type>();
+        void RegisterType(Type t)
         {
-            ComponentRegistry.RegisterStruct(world, t);
+            if (script.ComponentTypes.Contains(t)) return;
+            if (!registering.Add(t))
+                throw new InvalidOperationException($"{t.FullName}: required components form a cycle");
+            foreach (var required in ComponentRegistry.RequiredTypes(t))
+                if (types.Contains(required)) RegisterType(required);
+            if (IsBehaviour(t))
+            {
+                var id = ComponentRegistry.RegisterBehaviour(world, t);
+                BehaviourTypes[id] = t;
+            }
+            else
+            {
+                ComponentRegistry.RegisterStruct(world, t);
+            }
             script.ComponentTypes.Add(t);
         }
-        foreach (var t in types.Where(IsBehaviour).OrderBy(ComponentRegistry.NameOf, StringComparer.Ordinal))
-        {
-            var id = ComponentRegistry.RegisterBehaviour(world, t);
-            BehaviourTypes[id] = t;
-            script.ComponentTypes.Add(t);
-        }
+        foreach (var t in types.Where(IsComponentStruct).OrderBy(ComponentRegistry.NameOf, StringComparer.Ordinal)) RegisterType(t);
+        foreach (var t in types.Where(IsBehaviour).OrderBy(ComponentRegistry.NameOf, StringComparer.Ordinal)) RegisterType(t);
 
         var count = 0;
         foreach (var t in types.Where(IsScriptSystem).OrderBy(t => t.FullName, StringComparer.Ordinal))
@@ -115,6 +147,8 @@ internal static unsafe class Scripts
         {
             var component = ComponentIdOf(t);
             var order = t.GetCustomAttribute<ExecutionOrderAttribute>()?.Order ?? 0;
+            var hasStart = Overrides(t, "Start");
+            var any = false;
             foreach (var (name, method, stage) in new[]
             {
                 ("Update", BehaviourMethod.Update, Stage.Update),
@@ -123,7 +157,15 @@ internal static unsafe class Scripts
             })
             {
                 if (!Overrides(t, name)) continue;
-                Register(world, script, $"{t.FullName}.{name}", stage, order, new BehaviourSystem(component, method));
+                any = true;
+                // Each dispatcher starts new instances first, so Start runs
+                // before the instance's first magic method, whichever it is.
+                Register(world, script, $"{t.FullName}.{name}", stage, order, new BehaviourSystem(component, method, hasStart));
+                count++;
+            }
+            if (hasStart && !any)
+            {
+                Register(world, script, $"{t.FullName}.Start", Stage.Update, order, new BehaviourSystem(component, BehaviourMethod.None, true));
                 count++;
             }
         }
@@ -134,7 +176,35 @@ internal static unsafe class Scripts
         (uint)typeof(ComponentType<>).MakeGenericType(t)
             .GetField("Value", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!;
 
-    public static void Run(uint id, nint world) => Systems[id].Run(World.For(world));
+    /// <summary>Delivers a lifecycle event from the host to a behaviour object.</summary>
+    public static void Deliver(nint world, nint handle, Entity entity, uint evt)
+    {
+        var behaviour = Behaviour(handle);
+        if (behaviour is null) return;
+        behaviour.Entity = entity;
+        behaviour.World = World.For(world);
+        World.Current = behaviour.World;
+        try
+        {
+            switch (evt)
+            {
+                case Native.EventAwake: behaviour.RaiseAwake(); break;
+                case Native.EventOnDestroy: behaviour.RaiseOnDestroy(); break;
+                case Native.EventAfterReload: behaviour.RaiseAfterReload(); break;
+            }
+        }
+        catch (Exception e)
+        {
+            Host.Log(3, $"{behaviour.GetType().FullName} event {evt} on {entity} threw: {e}");
+        }
+    }
+
+    public static void Run(uint id, nint world)
+    {
+        var w = World.For(world);
+        World.Current = w;
+        Systems[id].Run(w);
+    }
 
     /// <summary>
     /// Undoes a load: lets systems clean up, drops every table entry that
@@ -159,6 +229,7 @@ internal static unsafe class Scripts
             ComponentRegistry.Forget(t);
         }
         script.ComponentTypes.Clear();
+        EngineBinding.Forget(script.MirrorTypes);
         var context = script.Context;
         script.Context = null;
         ComponentRegistry.ForgetAssembliesOf(context);

@@ -30,6 +30,23 @@ public struct Link : IComponent
     public ushort Strength;
 }
 
+/// <summary>
+/// Mixes 1-byte and 4-byte fields around `bool`s, so that a wrong layout
+/// (Marshal's 4-byte BOOL) shows up as wrong offsets. Also carries field
+/// attributes for the inspector.
+/// </summary>
+public struct Flags : IComponent
+{
+    public byte A;
+    public bool B;
+    [Range(0, 20), Tooltip("walk speed in m/s")]
+    public int C;
+    [HideInInspector]
+    public bool D;
+    [ReadOnly]
+    public float E;
+}
+
 /// <summary>The chunk tier: direct spans over the component columns.</summary>
 [System(Stage.Update)]
 public sealed class MoveSystem : ScriptSystem

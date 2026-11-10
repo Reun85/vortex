@@ -73,6 +73,25 @@ impl Access {
         }
     }
 
+    /// Declares a read of a resource known only by its type id, for script
+    /// systems. A write already declared for it wins.
+    pub fn add_resource_read_id(&mut self, id: TypeId) {
+        if !self.resource_writes.contains(&id)
+            && !self.resource_reads.contains(&id)
+        {
+            self.resource_reads.push(id);
+        }
+    }
+
+    /// Declares a write of a resource known only by its type id; it
+    /// replaces a read of the same resource.
+    pub fn add_resource_write_id(&mut self, id: TypeId) {
+        self.resource_reads.retain(|&r| r != id);
+        if !self.resource_writes.contains(&id) {
+            self.resource_writes.push(id);
+        }
+    }
+
     pub fn add_resource_read<T: 'static>(&mut self) {
         let id = TypeId::of::<T>();
         assert!(

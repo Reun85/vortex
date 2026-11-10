@@ -50,6 +50,17 @@ struct Vec2 {
     y: f32,
 }
 
+/// `Movers.Flags` with the bools as raw bytes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FlagsRaw {
+    a: u8,
+    b: u8,
+    c: i32,
+    d: u8,
+    e: f32,
+}
+
 fn insert_raw<T: Copy>(world: &mut World, e: Entity, name: &str, value: &T) {
     let id = world
         .components()
@@ -75,6 +86,7 @@ fn csharp_scripts_drive_the_world() {
     let movers_dir = build_csharp("samples/Movers");
 
     let mut world = World::new();
+    vortex_engine::register_script_types(&mut world);
     let host = ScriptHost::start(
         &mut world,
         &bridge_dir.join("Delta.Scripting.runtimeconfig.json"),
@@ -105,6 +117,7 @@ fn csharp_scripts_drive_the_world() {
         "Movers.Frozen",
         "Movers.Link",
         "Movers.Spinner",
+        "Movers.Flags",
     ] {
         assert!(world.components().id_by_name(name).is_some(), "{name}");
     }
@@ -124,6 +137,44 @@ fn csharp_scripts_drive_the_world() {
     };
     assert_eq!(&*world.reflection().get(nested).name, "Movers.Position");
     assert_eq!(world.reflection().get(nested).fields.len(), 2);
+    // `bool` has the managed 1-byte layout, not Marshal's 4-byte BOOL, and
+    // field attributes arrive as reflection attributes.
+    let flags = world.components().id_by_name("Movers.Flags").unwrap();
+    let flags_type = world
+        .reflection()
+        .get(world.components().info(flags).reflect.unwrap());
+    assert_eq!(flags_type.size, 16);
+    let at = |n: &str| {
+        let f = flags_type.field(n).unwrap();
+        (f.offset, f.ty.clone())
+    };
+    assert_eq!(at("A"), (0, FieldType::U8));
+    assert_eq!(at("B"), (1, FieldType::Bool));
+    assert_eq!(at("C"), (4, FieldType::I32));
+    assert_eq!(at("D"), (8, FieldType::Bool));
+    assert_eq!(at("E"), (12, FieldType::F32));
+    let c_attrs = &flags_type.field("C").unwrap().attrs;
+    assert_eq!(c_attrs.range, Some((0.0, 20.0)));
+    assert_eq!(c_attrs.tooltip.as_deref(), Some("walk speed in m/s"));
+    assert!(flags_type.field("D").unwrap().attrs.hidden);
+    assert!(flags_type.field("E").unwrap().attrs.read_only);
+    assert!(!flags_type.field("A").unwrap().attrs.hidden);
+    // A raw byte other than 0 or 1 reads as `true` instead of being UB.
+    let flagged = world.spawn();
+    let raw = FlagsRaw {
+        a: 1,
+        b: 2,
+        c: 7,
+        d: 0,
+        e: 0.0,
+    };
+    insert_raw(&mut world, flagged, "Movers.Flags", &raw);
+    let v = world.component_value(flagged, "Movers.Flags").unwrap();
+    assert_eq!(v["B"], true);
+    assert_eq!(v["D"], false);
+    assert_eq!(v["C"], 7);
+    world.despawn(flagged).unwrap();
+
     // Behaviour classes are components too, holding one GC handle per row.
     let spinner = world.components().id_by_name("Movers.Spinner").unwrap();
     assert_eq!(world.components().info(spinner).layout.size(), 8);

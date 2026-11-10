@@ -8,7 +8,7 @@ namespace Delta;
 
 internal static class Native
 {
-    public const uint ApiVersion = 1;
+    public const uint ApiVersion = 6;
     public const int MaxTerms = 16;
 
     // ComponentDescFfi.Kind
@@ -18,9 +18,20 @@ internal static class Native
     public const uint KindStruct = 3;
 
     // FieldDescFfi.Ty
+    public const uint FtBool = 0;
     public const uint FtI8 = 1, FtI16 = 2, FtI32 = 3, FtI64 = 4;
     public const uint FtU8 = 5, FtU16 = 6, FtU32 = 7, FtU64 = 8;
-    public const uint FtF32 = 9, FtF64 = 10, FtEntity = 11, FtStruct = 12;
+    public const uint FtF32 = 9, FtF64 = 10, FtEntity = 11, FtStruct = 12, FtArray = 13;
+    public const uint FtVec2 = 14, FtVec3 = 15, FtVec4 = 16, FtQuat = 17;
+
+    // ScriptApi.BehaviourEvent
+    public const uint EventAwake = 0, EventOnDestroy = 1, EventAfterReload = 4;
+
+    // FieldDescFfi.Flags
+    public const uint FfHidden = 1, FfReadOnly = 2, FfHasRange = 4;
+
+    /// <summary>Size of <see cref="FieldDescFfi"/>; Rust asserts the same number.</summary>
+    public const int FieldDescSize = 72;
 
     public const uint Invalid = uint.MaxValue;
 }
@@ -33,7 +44,13 @@ internal unsafe struct FieldDescFfi
     public uint Offset;
     public uint Ty;
     public uint Aux;
-    public uint Pad;
+    public uint Flags;
+    public double RangeLo;
+    public double RangeHi;
+    public byte* Tooltip;
+    public nuint TooltipLen;
+    public uint ElemTy;
+    public uint ElemAux;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -46,6 +63,7 @@ internal unsafe struct ComponentDescFfi
     public uint Kind;
     public uint FieldCount;
     public FieldDescFfi* Fields;
+    public IdList Requires;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -112,6 +130,13 @@ internal unsafe struct HostApi
     public delegate* unmanaged<nint, ulong, uint, void> CmdRemove;
     public delegate* unmanaged<uint, byte*, nuint, void> Log;
     public delegate* unmanaged<nint, byte*, nuint, nuint> LastError;
+    public delegate* unmanaged<nint, uint, void> QueryFree;
+    public delegate* unmanaged<nint, byte*, nuint, uint> ResourceIdByName;
+    public delegate* unmanaged<nint, uint, byte, byte*> ResourcePtr;
+    public delegate* unmanaged<nint, byte*, nuint, nuint, nuint, FieldDescFfi*, nuint, uint> CheckLayout;
+    public delegate* unmanaged<nint, byte*, nuint, uint> InputAxisId;
+    public delegate* unmanaged<nint, ulong, byte*, nuint, nuint> EntityToSceneId;
+    public delegate* unmanaged<nint, byte*, nuint, ulong> SceneIdToEntity;
 }
 
 /// <summary>C# -> Rust, filled in by <see cref="Bridge.Initialize"/>. Field order is the contract.</summary>
@@ -130,4 +155,13 @@ internal unsafe struct ScriptApi
     public delegate* unmanaged<ulong, byte*, nuint, nuint> SerializeBehaviour;
     public delegate* unmanaged<uint, byte*, nuint, ulong> DeserializeBehaviour;
     public delegate* unmanaged<byte*, nuint, nuint> TakeWarnings;
+    public delegate* unmanaged<nint, ulong, ulong, uint, void> BehaviourEvent;
+    public delegate* unmanaged<nint, ulong, uint, nuint> BehaviourToJson;
+    public delegate* unmanaged<nint, uint, byte*, nuint, ulong> BehaviourFromJson;
+    public delegate* unmanaged<nint, ulong, byte*, nuint, nuint> BehaviourGetMember;
+    public delegate* unmanaged<nint, ulong, byte*, nuint, byte*, nuint, nuint> BehaviourSetMember;
+    public delegate* unmanaged<uint, nuint> BehaviourSchema;
+    public delegate* unmanaged<nint, uint, nuint> BehaviourDefaultJson;
+    public delegate* unmanaged<nint, ulong, ulong, ulong, uint> BehaviourRemapEntity;
+    public delegate* unmanaged<byte*, nuint, nuint> TakeResult;
 }

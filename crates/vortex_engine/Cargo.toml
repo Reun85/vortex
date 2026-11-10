@@ -1,0 +1,11 @@
+[package]
+name = "vortex_engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+delta = { path = "../delta" }
+vortex_math = { path = "../vortex_math" }
+
+[lints]
+workspace = true

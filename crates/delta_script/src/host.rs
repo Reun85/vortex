@@ -281,8 +281,14 @@ impl DotnetHost {
         &self.dotnet_root
     }
 
-    /// Loads `assembly_path` (into the runtime's default load context) and
-    /// returns the address of a `[UnmanagedCallersOnly]` static method.
+    /// Loads `assembly_path` and returns the address of a
+    /// `[UnmanagedCallersOnly]` static method.
+    ///
+    /// The runtime's `load_assembly_and_get_function_pointer` delegate puts
+    /// each assembly it loads into its own isolated load context, not the
+    /// default one. That is why `ScriptLoadContext` has to hand back the
+    /// already-loaded bridge assembly by identity: otherwise a script would
+    /// get a second copy of `Delta.Scripting` with its own statics and types.
     ///
     /// `type_name` is `"Namespace.Type, AssemblyName"`.
     ///

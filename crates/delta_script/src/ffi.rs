@@ -4,7 +4,7 @@
 
 use delta::{World, query::Cursor};
 
-pub const API_VERSION: u32 = 1;
+pub const API_VERSION: u32 = 6;
 
 /// Most data terms a query may have; sizes [`ChunkFfi::columns`].
 pub const MAX_TERMS: usize = 16;
@@ -31,6 +31,37 @@ pub const FT_F64: u32 = 10;
 pub const FT_ENTITY: u32 = 11;
 /// `aux` is the reflect id of a struct registered with [`KIND_STRUCT`].
 pub const FT_STRUCT: u32 = 12;
+/// `aux` is the length; `elem_ty`/`elem_aux` describe the element (a
+/// scalar, or a struct by reflect id).
+pub const FT_ARRAY: u32 = 13;
+/// `System.Numerics` math types, which are `vortex::Vec2/3/4/Quat` in Rust.
+pub const FT_VEC2: u32 = 14;
+pub const FT_VEC3: u32 = 15;
+pub const FT_VEC4: u32 = 16;
+pub const FT_QUAT: u32 = 17;
+
+/// `ScriptApi::behaviour_to_json` mode: scenes, the inspector, undo, play
+/// mode. Public and `[SerializeField]` members; entities as scene ids.
+pub const MODE_PERSIST: u32 = 0;
+/// `ScriptApi::behaviour_to_json` mode: hot reload. Every field, entities
+/// as raw handles.
+pub const MODE_SNAPSHOT: u32 = 1;
+
+/// `ScriptApi::behaviour_event`: lifecycle events of a behaviour.
+pub const EVENT_AWAKE: u32 = 0;
+pub const EVENT_ON_DESTROY: u32 = 1;
+/// Reserved for a later phase.
+pub const EVENT_ON_ENABLE: u32 = 2;
+/// Reserved for a later phase.
+pub const EVENT_ON_DISABLE: u32 = 3;
+/// A hot reload rebuilt the instance from its saved state.
+pub const EVENT_AFTER_RELOAD: u32 = 4;
+
+/// `FieldDescFfi::flags`
+pub const FF_HIDDEN: u32 = 1;
+pub const FF_READ_ONLY: u32 = 2;
+/// `range_lo`/`range_hi` are meaningful.
+pub const FF_HAS_RANGE: u32 = 4;
 
 #[repr(C)]
 pub struct FieldDescFfi {
@@ -39,8 +70,18 @@ pub struct FieldDescFfi {
     pub offset: u32,
     pub ty: u32,
     pub aux: u32,
-    pub _pad: u32,
+    pub flags: u32,
+    pub range_lo: f64,
+    pub range_hi: f64,
+    pub tooltip: *const u8,
+    pub tooltip_len: usize,
+    pub elem_ty: u32,
+    pub elem_aux: u32,
 }
+
+/// Checked by the managed side too, so the two mirrors cannot drift apart.
+pub const FIELD_DESC_SIZE: usize = 72;
+const _: () = assert!(size_of::<FieldDescFfi>() == FIELD_DESC_SIZE);
 
 #[repr(C)]
 pub struct ComponentDescFfi {
@@ -51,6 +92,9 @@ pub struct ComponentDescFfi {
     pub kind: u32,
     pub field_count: u32,
     pub fields: *const FieldDescFfi,
+    /// Component ids inserted alongside this one when missing (data and tag
+    /// components only).
+    pub requires: IdList,
 }
 
 #[repr(C)]
@@ -116,6 +160,40 @@ pub struct HostApi {
     pub cmd_remove: unsafe extern "C" fn(*mut World, u64, u32),
     pub log: unsafe extern "C" fn(u32, *const u8, usize),
     pub last_error: unsafe extern "C" fn(*mut World, *mut u8, usize) -> usize,
+    /// Releases a query; its id may be handed out again.
+    pub query_free: unsafe extern "C" fn(*mut World, u32),
+    /// The id of a resource exposed to scripts by name, or `u32::MAX`.
+    pub resource_id_by_name:
+        unsafe extern "C" fn(*mut World, *const u8, usize) -> u32,
+    /// The address of an exposed resource's value (`write` != 0 to modify
+    /// it), or null. Valid for the system run; the resource may be replaced
+    /// between runs, so callers must not cache it.
+    pub resource_ptr: unsafe extern "C" fn(*mut World, u32, u8) -> *mut u8,
+    /// Compares a C# mirror (name, size, align, fields) with the Rust layout
+    /// of the exposed resource or script-visible component of that name.
+    /// Returns 0 when they are identical, `u32::MAX` otherwise with both
+    /// layouts in `last_error`.
+    pub check_layout: unsafe extern "C" fn(
+        *mut World,
+        *const u8,
+        usize,
+        usize,
+        usize,
+        *const FieldDescFfi,
+        usize,
+    ) -> u32,
+    /// The slot of an input axis name, or `u32::MAX`.
+    pub input_axis_id:
+        unsafe extern "C" fn(*mut World, *const u8, usize) -> u32,
+    /// The scene id of an entity, written as text; also for an entity that
+    /// was despawned if the world still remembers its id. Returns the text
+    /// length (copying at most `cap` bytes), or 0 when it has none.
+    pub entity_to_scene_id:
+        unsafe extern "C" fn(*mut World, u64, *mut u8, usize) -> usize,
+    /// The entity for a scene id given as text, or `u64::MAX` (the null
+    /// entity) when none is known.
+    pub scene_id_to_entity:
+        unsafe extern "C" fn(*mut World, *const u8, usize) -> u64,
 }
 
 /// C# -> Rust, filled in by `Bridge.Initialize`. Optional so an
@@ -156,4 +234,44 @@ pub struct ScriptApi {
         Option<unsafe extern "C" fn(u32, *const u8, usize) -> u64>,
     /// Drains the warnings the managed side collected (newline separated).
     pub take_warnings: Option<unsafe extern "C" fn(*mut u8, usize) -> usize>,
+    /// Delivers a lifecycle event (`EVENT_*`) to a behaviour: world, the
+    /// object's handle, the entity it is on, the event. The managed side sets
+    /// the object's `Entity` and `World` first.
+    pub behaviour_event:
+        Option<unsafe extern "C" fn(*mut World, u64, u64, u32)>,
+    /// Serializes a behaviour (`MODE_*`) without tearing it down. Stores the
+    /// JSON, returns its length or `usize::MAX` (see `last_error`); fetch it
+    /// with `take_result`.
+    pub behaviour_to_json:
+        Option<unsafe extern "C" fn(*mut World, u64, u32) -> usize>,
+    /// Builds a persisted behaviour of a class from JSON (running
+    /// `OnAfterDeserialize`) and returns its handle, or 0 (see `last_error`).
+    pub behaviour_from_json:
+        Option<unsafe extern "C" fn(*mut World, u32, *const u8, usize) -> u64>,
+    /// One member of a behaviour (path "" is the whole), as JSON.
+    pub behaviour_get_member: Option<
+        unsafe extern "C" fn(*mut World, u64, *const u8, usize) -> usize,
+    >,
+    /// Sets one member of the live object in place from JSON and stores the
+    /// old value's JSON.
+    pub behaviour_set_member: Option<
+        unsafe extern "C" fn(
+            *mut World,
+            u64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+        ) -> usize,
+    >,
+    /// The inspector's member list for a class, as JSON.
+    pub behaviour_schema: Option<unsafe extern "C" fn(u32) -> usize>,
+    /// A default instance of a class, persisted, as JSON.
+    pub behaviour_default_json:
+        Option<unsafe extern "C" fn(*mut World, u32) -> usize>,
+    /// Rewrites entity references inside a behaviour; returns how many.
+    pub behaviour_remap_entity:
+        Option<unsafe extern "C" fn(*mut World, u64, u64, u64) -> u32>,
+    /// Copies the text stored by the last call that returned a length.
+    pub take_result: Option<unsafe extern "C" fn(*mut u8, usize) -> usize>,
 }

@@ -18,6 +18,9 @@ public sealed unsafe class World
 
     World(nint ptr) => Ptr = ptr;
 
+    /// <summary>The world the running system belongs to (one scripting world per process).</summary>
+    internal static World Current { get; set; } = null!;
+
     internal static World For(nint ptr)
     {
         lock (Worlds)
@@ -57,6 +60,10 @@ public sealed unsafe class World
         return behaviour;
     }
 
+    /// <summary>Removes a behaviour; its <c>OnDestroy</c> runs at the sync point.</summary>
+    public void RemoveBehaviour<T>(Entity e) where T : Behaviour =>
+        Host.Api->CmdRemove(Ptr, e.Bits, ComponentType<T>.Id);
+
     /// <summary>Direct access to a component of an existing entity. Marks it changed.</summary>
     public ref T Get<T>(Entity e) where T : unmanaged, IComponent
     {
@@ -64,6 +71,9 @@ public sealed unsafe class World
         if (p == null) throw new InvalidOperationException($"{e} has no {typeof(T).Name}");
         return ref *(T*)p;
     }
+
+    /// <summary>Names a component of an entity for repeated use; see <see cref="ComponentRef{T}"/>.</summary>
+    public ComponentRef<T> Ref<T>(Entity e) where T : unmanaged, IComponent => new(this, e);
 
     public bool TryGet<T>(Entity e, out T value) where T : unmanaged, IComponent
     {

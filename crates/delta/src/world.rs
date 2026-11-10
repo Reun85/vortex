@@ -13,10 +13,10 @@ use crate::{
     commands::CommandQueue,
     component::{ComponentId, Components, Storage},
     entity::{Entities, Entity, EntityLocation},
-    hooks::{DeferredWorld, Hook, HooksBuilder},
+    hooks::{DeferredWorld, Hook, HookContext, HooksBuilder},
     observer::{Events, ObserverIndex, TriggerFrame},
     reflect::TypeRegistry,
-    scene::{Retired, SceneId},
+    scene::{Retired, SceneId, ZeroedBuf},
     tick::{CHECK_TICK_THRESHOLD, Tick},
 };
 
@@ -61,6 +61,7 @@ pub struct World {
     pub(crate) observer_hooks_registered: bool,
     pub(crate) message_updaters: Vec<MessageUpdater>,
     pub(crate) reflection: TypeRegistry,
+    pub(crate) exposed: Vec<crate::engine::ExposedResource>,
     /// Kept patched by hooks on [`SceneId`], so it follows spawn and despawn.
     pub(crate) scene_ids: HashMap<SceneId, Entity>,
     /// Despawned scene entities, when tracking is on.
@@ -94,10 +95,12 @@ impl World {
             observer_hooks_registered: false,
             message_updaters: Vec::new(),
             reflection: TypeRegistry::default(),
+            exposed: Vec::new(),
             scene_ids: HashMap::new(),
             retired: None,
         };
         crate::scene::init(&mut world);
+        crate::engine::init(&mut world);
         world
     }
 
@@ -170,9 +173,15 @@ impl World {
         }
     }
 
-    fn run_hook(&mut self, hook: Option<Hook>, e: Entity) {
+    fn run_hook(&mut self, hook: Option<Hook>, e: Entity, c: ComponentId) {
         if let Some(hook) = hook {
-            hook(DeferredWorld { world: self }, e);
+            hook(
+                DeferredWorld { world: self },
+                HookContext {
+                    entity: e,
+                    component: c,
+                },
+            );
         }
     }
 
@@ -181,9 +190,17 @@ impl World {
     fn fire_remove_hooks(&mut self, e: Entity, ids: &[ComponentId]) {
         for &c in ids {
             let hooks = self.components.hooks(c);
-            self.run_hook(hooks.on_replace, e);
-            self.run_hook(hooks.on_remove, e);
+            self.run_hook(hooks.on_replace, e, c);
+            self.run_hook(hooks.on_remove, e, c);
         }
+    }
+
+    /// The world's deferred buffer as a raw pointer, for hosts that deliver
+    /// callbacks into code that records commands through a world pointer
+    /// (see [`DeferredWorld::raw_parts`]). Flush with
+    /// [`flush_deferred`](Self::flush_deferred).
+    pub fn deferred_queue_ptr(&mut self) -> *mut CommandQueue {
+        &raw mut self.deferred
     }
 
     /// The deferred buffer together with the allocator, for `Commands`.
@@ -259,6 +276,10 @@ impl World {
         if self.components.any_hooks() {
             let ids = self.archetypes.get(loc.archetype).components().to_vec();
             self.fire_remove_hooks(e, &ids);
+            // A hook may have reserved entities (a script spawning from
+            // `OnDestroy`); `free` needs them placed. `e` keeps its row:
+            // flushing only appends to the empty archetype.
+            self.flush_entities();
         }
         if self.retired.is_some()
             && let Some(id) = self.scene_id_of(e)
@@ -328,6 +349,21 @@ impl World {
         let loc = self.entities.location(e).ok_or(DeadEntity(e))?;
         let hooks_on = self.components.any_hooks();
 
+        // Required components join the same move, so the entity never has
+        // `A` without the `B` that `A` requires, not even inside a hook.
+        let required = self.missing_required(loc.archetype, items);
+        let with_required;
+        let items = if required.is_empty() {
+            items
+        } else {
+            with_required = items
+                .iter()
+                .copied()
+                .chain(required.iter().map(|(c, b)| (*c, b.ptr.cast_const())))
+                .collect::<Vec<_>>();
+            &with_required[..]
+        };
+
         // Overwritten values announce their replacement while still intact.
         if hooks_on {
             let arch = self.archetypes.get(loc.archetype);
@@ -338,7 +374,7 @@ impl World {
                 .collect();
             for c in replaced {
                 let hook = self.components.hooks(c).on_replace;
-                self.run_hook(hook, e);
+                self.run_hook(hook, e, c);
             }
         }
 
@@ -378,15 +414,62 @@ impl World {
         if hooks_on {
             for &(c, _) in &added {
                 let hook = self.components.hooks(c).on_add;
-                self.run_hook(hook, e);
+                self.run_hook(hook, e, c);
             }
             for &(c, _) in items {
                 let hook = self.components.hooks(c).on_insert;
-                self.run_hook(hook, e);
+                self.run_hook(hook, e, c);
             }
         }
         self.finish_op();
         Ok(())
+    }
+
+    /// The components `items` require (transitively) that neither `items`
+    /// nor the entity's archetype already provide, as zeroed values.
+    fn missing_required(
+        &self,
+        archetype: crate::archetype::ArchetypeId,
+        items: &[(ComponentId, *const u8)],
+    ) -> Vec<(ComponentId, ZeroedBuf)> {
+        let arch = self.archetypes.get(archetype);
+        let mut out: Vec<(ComponentId, ZeroedBuf)> = Vec::new();
+        let mut work: Vec<ComponentId> =
+            items.iter().map(|&(c, _)| c).collect();
+        while let Some(c) = work.pop() {
+            for &r in &*self.components.info(c).requires {
+                let present = arch.contains(r)
+                    || items.iter().any(|&(i, _)| i == r)
+                    || out.iter().any(|(i, _)| *i == r);
+                if !present {
+                    out.push((
+                        r,
+                        ZeroedBuf::new(self.components.info(r).layout),
+                    ));
+                    work.push(r);
+                }
+            }
+        }
+        out
+    }
+
+    /// Declares that inserting a `T` also inserts a zeroed `R` when the
+    /// entity lacks one. See [`Components::set_requires`].
+    ///
+    /// # Panics
+    /// If `R` has drop glue.
+    pub fn register_required<T, R>(&mut self)
+    where
+        T: Send + Sync + 'static,
+        R: Send + Sync + 'static,
+    {
+        let t = self.components.register::<T>();
+        let r = self.components.register::<R>();
+        let mut all = self.components.info(t).requires.to_vec();
+        if !all.contains(&r) {
+            all.push(r);
+        }
+        self.components.set_requires(t, &all);
     }
 
     /// Removes component `c` from `e`, dropping it. Returns whether the
@@ -746,6 +829,82 @@ mod tests {
         w.validate();
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct Needs(u32);
+
+    #[test]
+    fn required_components_join_the_same_move() {
+        let mut w = World::new();
+        // Needs -> A -> Tag, and B on its own.
+        w.register_required::<Needs, A>();
+        w.register_required::<A, Tag>();
+        w.components_mut().register::<B>();
+        let e = w.spawn();
+        w.insert(e, B([1, 2])).unwrap();
+        let archetypes = w.archetypes().len();
+        w.insert(e, Needs(7)).unwrap();
+        // The entity gained Needs, A and Tag in one move: exactly one new
+        // archetype ([B, Needs, A, Tag]) and no intermediates.
+        assert_eq!(w.archetypes().len(), archetypes + 1);
+        assert_eq!(w.get::<Needs>(e), Some(&Needs(7)));
+        assert_eq!(w.get::<A>(e), Some(&A(0)), "zero-initialized");
+        assert!(w.has::<Tag>(e));
+        assert_eq!(w.get::<B>(e), Some(&B([1, 2])), "existing data kept");
+
+        // A value the caller provided wins over the zeroed default, and one
+        // the entity already has is never overwritten.
+        let f = w.spawn();
+        w.insert(f, A(5)).unwrap();
+        w.insert(f, Needs(1)).unwrap();
+        assert_eq!(w.get::<A>(f), Some(&A(5)));
+        let g = w.spawn();
+        let (needs, a) = (Needs(2), A(9));
+        let ids = [
+            w.components().id_of::<Needs>().unwrap(),
+            w.components().id_of::<A>().unwrap(),
+        ];
+        // SAFETY: each pointer is a valid value of its component's type.
+        unsafe {
+            w.insert_many_by_id(
+                g,
+                &[
+                    (ids[0], (&raw const needs).cast()),
+                    (ids[1], (&raw const a).cast()),
+                ],
+            )
+        }
+        .unwrap();
+        assert_eq!(w.get::<A>(g), Some(&A(9)));
+
+        // Construction only: a required component can be removed later.
+        assert_eq!(w.remove::<A>(e), Ok(true));
+        assert!(w.has::<Needs>(e));
+        w.validate();
+    }
+
+    #[test]
+    fn required_components_exist_when_hooks_run() {
+        #[derive(Default)]
+        struct Seen(Vec<bool>);
+        let mut w = World::new();
+        w.insert_resource(Seen::default());
+        w.register_required::<Needs, A>();
+        w.register_hooks::<Needs>().on_add(|mut w, cx| {
+            let has = w.has::<A>(cx.entity);
+            w.resource_mut::<Seen>().unwrap().0.push(has);
+        });
+        let e = w.spawn();
+        w.insert(e, Needs(1)).unwrap();
+        assert_eq!(w.resource::<Seen>().unwrap().0, [true]);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot be a required component")]
+    fn required_components_must_be_plain_data() {
+        let mut w = World::new();
+        w.register_required::<A, S>();
+    }
+
     fn changed_since(w: &World, last_run: Tick) -> usize {
         use crate::query::{QueryDesc, QueryState};
         let c = w.components().id_of::<A>().unwrap();
@@ -885,6 +1044,8 @@ mod tests {
             storage: Storage::Table,
             hooks: ComponentHooks::default(),
             reflect: None,
+            requires: Box::default(),
+            external: None,
         });
         // Entities across two archetypes (with and without `A`).
         let ents: Vec<_> = (0..4).map(|_| w.spawn()).collect();

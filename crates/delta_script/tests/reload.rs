@@ -9,7 +9,7 @@ use std::{
     process::Command,
 };
 
-use delta::{Entity, Schedule, World};
+use delta::{Entity, Kind, Schedule, World};
 use delta_script::ScriptHost;
 
 fn workspace_root() -> PathBuf {
@@ -153,9 +153,10 @@ fn scripts_reload_while_the_world_keeps_its_state() {
         )
         .join("Reloadable.dll")
     };
-    let (v1, v2, v3) = (dll("V1"), dll("V2"), dll("V3"));
+    let (v1, v2, v3, v4) = (dll("V1"), dll("V2"), dll("V3"), dll("V4"));
 
     let mut world = World::new();
+    vortex_engine::register_script_types(&mut world);
     let host = ScriptHost::start(
         &mut world,
         &bridge.join("Delta.Scripting.runtimeconfig.json"),
@@ -319,7 +320,7 @@ fn scripts_reload_while_the_world_keeps_its_state() {
     assert_eq!((r.version, r.static_runs), (2, 3));
 
     // ===== V2 -> V3 ==========================================================
-    let (_asm3, report) = host
+    let (asm3, report) = host
         .reload(&mut world, &mut schedule, &asm2, &v3)
         .expect("reload to V3");
     eprintln!("V2 -> V3 warnings: {:#?}", report.warnings);
@@ -346,5 +347,56 @@ fn scripts_reload_while_the_world_keeps_its_state() {
     }
     let r: Report = read_raw(&world, rep, "Reloadable.Report");
     assert_eq!((r.version, r.static_runs), (3, 1));
+    assert_eq!(world.entities().len(), entity_count);
+
+    // ===== V3 -> V3, fifty times =============================================
+    // Every reload must free the queries of the assembly it replaces: the
+    // slot table stops growing after the first.
+    let (mut current, _) = (asm3, ());
+    let mut slots = None;
+    for i in 0..50 {
+        let (next, report) = host
+            .reload(&mut world, &mut schedule, &current, &v3)
+            .expect("reload V3 again");
+        assert!(report.kind_changes.is_empty());
+        current = next;
+        schedule.run(&mut world); // systems build their queries here
+        let (live, total) = ScriptHost::query_counts(&world);
+        assert_eq!(live, *slots.get_or_insert(total), "reload {i}");
+        assert_eq!(total, live, "reload {i} leaked query slots");
+        assert_eq!(host.live_handles(), 4, "reload {i}");
+    }
+
+    // ===== V3 -> V4: Counter stops being a Behaviour =========================
+    // A different kind is a different component. Its values are removed, its
+    // handles are gone, and the report says so.
+    let (_asm4, report) = host
+        .reload(&mut world, &mut schedule, &current, &v4)
+        .expect("reload to V4");
+    eprintln!("V3 -> V4: {:#?}", report.kind_changes);
+    assert_eq!(
+        report.kind_changes,
+        [(
+            "Reloadable.Counter".to_owned(),
+            Kind::ScriptManaged,
+            Kind::ScriptUnmanaged
+        )]
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("Reloadable.Counter changed")),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(entities_with(&world, "Reloadable.Counter"), []);
+    // Only Goner's handle is left: the Counters' handles were freed, once.
+    assert_eq!(host.live_handles(), 1);
+    schedule.run(&mut world);
+    assert_eq!(
+        read_raw::<Report>(&world, goners[0], "Reloadable.Report").version,
+        4
+    );
     assert_eq!(world.entities().len(), entity_count);
 }

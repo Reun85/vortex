@@ -13,6 +13,7 @@ use delta::{
     ComponentId,
     Entity,
     Kind,
+    RETIRED_MARK,
     Schedule,
     System,
     Tick,
@@ -29,7 +30,7 @@ use crate::{
         ScriptState,
         state,
     },
-    ffi::{API_VERSION, HostApi, ScriptApi},
+    ffi::{API_VERSION, EVENT_AFTER_RELOAD, HostApi, ScriptApi},
     host::{DotnetHost, HostError},
 };
 
@@ -72,6 +73,7 @@ struct Api {
     serialize_behaviour: unsafe extern "C" fn(u64, *mut u8, usize) -> usize,
     deserialize_behaviour: unsafe extern "C" fn(u32, *const u8, usize) -> u64,
     take_warnings: unsafe extern "C" fn(*mut u8, usize) -> usize,
+    behaviour_event: unsafe extern "C" fn(*mut World, u64, u64, u32),
     free_handle: unsafe extern "C" fn(u64),
 }
 
@@ -102,6 +104,11 @@ pub struct ReloadReport {
     pub removed_behaviours: Vec<(String, Vec<Entity>)>,
     /// Behaviours restored from records of an earlier reload.
     pub restored_from_records: usize,
+    /// Classes that changed what they are (a `Behaviour` that became a
+    /// struct, or the reverse): the name, the old kind and the new kind. The
+    /// old component is removed from every entity, and a behaviour's state is
+    /// kept under its name in case the class changes back.
+    pub kind_changes: Vec<(String, Kind, Kind)>,
     /// Fields that were dropped or reset, state that did not fit, and the
     /// like.
     pub warnings: Vec<String>,
@@ -124,6 +131,11 @@ struct Snapshot {
 impl ScriptHost {
     /// Starts (or joins) the .NET runtime, loads `bridge_assembly`
     /// (`Delta.Scripting.dll`), and exchanges function tables with it.
+    ///
+    /// The `World` must stay at one address for as long as scripts run: the
+    /// managed side caches `World` objects by pointer. Keep it in a
+    /// `Box<World>` (or otherwise pinned); debug builds assert that every
+    /// script system is run with the same pointer.
     pub fn start(
         world: &mut World,
         runtime_config: &Path,
@@ -162,6 +174,34 @@ impl ScriptHost {
         let missing = |name: &str| {
             ScriptError::Script(format!("script API did not provide `{name}`"))
         };
+        let managed = crate::managed::ManagedFns {
+            to_json: api
+                .behaviour_to_json
+                .ok_or_else(|| missing("behaviour_to_json"))?,
+            from_json: api
+                .behaviour_from_json
+                .ok_or_else(|| missing("behaviour_from_json"))?,
+            get_member: api
+                .behaviour_get_member
+                .ok_or_else(|| missing("behaviour_get_member"))?,
+            set_member: api
+                .behaviour_set_member
+                .ok_or_else(|| missing("behaviour_set_member"))?,
+            schema: api
+                .behaviour_schema
+                .ok_or_else(|| missing("behaviour_schema"))?,
+            default_json: api
+                .behaviour_default_json
+                .ok_or_else(|| missing("behaviour_default_json"))?,
+            remap_entity: api
+                .behaviour_remap_entity
+                .ok_or_else(|| missing("behaviour_remap_entity"))?,
+            take_result: api
+                .take_result
+                .ok_or_else(|| missing("take_result"))?,
+            last_error: api.last_error.ok_or_else(|| missing("last_error"))?,
+        };
+        let _ = crate::managed::MANAGED.set(managed);
         let api = Api {
             load_assembly: api
                 .load_assembly
@@ -186,11 +226,15 @@ impl ScriptHost {
             take_warnings: api
                 .take_warnings
                 .ok_or_else(|| missing("take_warnings"))?,
+            behaviour_event: api
+                .behaviour_event
+                .ok_or_else(|| missing("behaviour_event"))?,
             free_handle: api
                 .free_handle
                 .ok_or_else(|| missing("free_handle"))?,
         };
         let _ = FREE_HANDLE.set(api.free_handle);
+        let _ = bridge::BEHAVIOUR_EVENT.set(api.behaviour_event);
         Ok(Self { api })
     }
 
@@ -279,9 +323,18 @@ impl ScriptHost {
                     queue: delta::CommandQueue::default(),
                     last_run: Tick::new(0),
                     access: Access::default(),
+                    access_known: false,
                 }),
             );
         }
+    }
+
+    /// (live queries, query slots ever allocated). Reloading must not make
+    /// the second number grow.
+    pub fn query_counts(world: &World) -> (usize, usize) {
+        world
+            .resource::<ScriptState>()
+            .map_or((0, 0), ScriptState::query_counts)
     }
 
     /// How many managed component values currently hold a `GCHandle`.
@@ -418,6 +471,47 @@ impl ScriptHost {
         }
     }
 
+    /// Components of the old assembly that the new one registered under a
+    /// different kind were retired by `register_component_impl`. Takes them
+    /// off every entity that still has them (a behaviour's saved state was
+    /// already kept by `restore_behaviours`; its handles are null).
+    fn remove_retired(
+        &self,
+        world: &mut World,
+        old: &ScriptAssembly,
+        report: &mut ReloadReport,
+    ) {
+        for &c in &old.components {
+            let info = world.components().info(c);
+            if !info.name.contains(RETIRED_MARK) {
+                continue;
+            }
+            let name = original_name(&info.name);
+            let old_kind = info.kind;
+            let entities: Vec<Entity> = world
+                .archetypes()
+                .iter()
+                .filter(|a| a.column(c).is_some())
+                .flat_map(|a| a.entities().iter().copied())
+                .collect();
+            for &e in &entities {
+                let _ = world.remove_by_id(e, c);
+            }
+            let new_kind = world
+                .components()
+                .id_by_name(&name)
+                .map(|n| world.components().info(n).kind);
+            if let Some(new_kind) = new_kind {
+                report.warnings.push(format!(
+                    "{name} changed from {old_kind:?} to {new_kind:?}: its \
+                     values were removed from {} entities",
+                    entities.len()
+                ));
+                report.kind_changes.push((name, old_kind, new_kind));
+            }
+        }
+    }
+
     /// Step 7 (and step 8 for classes that are gone): puts saved behaviours
     /// back into the columns of their new class, in place.
     fn restore_behaviours(
@@ -444,12 +538,14 @@ impl ScriptHost {
                 // SAFETY: the cell holds the null handle left by the
                 // snapshot; the new object's handle takes its place.
                 unsafe { cell.write_unaligned(handle) };
+                self.after_reload(world, snap.entity, handle);
                 report.restored_behaviours += 1;
                 continue;
             }
             // The class is gone (or its state could not be rebuilt): take
             // the component off the entity, but keep the state.
-            let name = world.components().info(snap.component).name.to_string();
+            let name =
+                original_name(&world.components().info(snap.component).name);
             let _ = world.remove_by_id(snap.entity, snap.component);
             removed.entry(snap.component).or_default().push(snap.entity);
             state(world).removed_records.push(RemovedRecord {
@@ -459,13 +555,32 @@ impl ScriptHost {
             });
         }
         for (c, entities) in removed {
-            let name = world.components().info(c).name.to_string();
+            let name = original_name(&world.components().info(c).name);
             report.warnings.push(format!(
                 "{name} no longer exists: removed from {} entities (state kept)",
                 entities.len()
             ));
             report.removed_behaviours.push((name, entities));
         }
+    }
+
+    /// Tells a rebuilt behaviour it came back from a reload. Commands it
+    /// records go to the world's deferred buffer.
+    fn after_reload(&self, world: &mut World, entity: Entity, handle: u64) {
+        let queue: *mut delta::CommandQueue = world.deferred_queue_ptr();
+        let previous =
+            std::mem::replace(&mut state(world).current_queue, queue);
+        // SAFETY: the callback was handed out by the script runtime, and the
+        // world pointer is the one scripts run in.
+        unsafe {
+            (self.api.behaviour_event)(
+                world,
+                handle,
+                entity.to_bits(),
+                EVENT_AFTER_RELOAD,
+            );
+        }
+        state(world).current_queue = previous;
     }
 
     /// Brings back behaviours whose class returned: records left by an
@@ -502,6 +617,8 @@ impl ScriptHost {
                 keep.push(record);
                 continue;
             }
+            // The insert would announce a fresh `Awake`; this is a reload.
+            state(world).quiet_lifecycle = true;
             // SAFETY: a managed value is one u64 handle; the world takes
             // ownership of it.
             let inserted = unsafe {
@@ -511,7 +628,9 @@ impl ScriptHost {
                     std::ptr::from_ref(&handle).cast(),
                 )
             };
+            state(world).quiet_lifecycle = false;
             if inserted.is_ok() {
+                self.after_reload(world, record.entity, handle);
                 report.restored_from_records += 1;
             }
         }
@@ -567,6 +686,7 @@ impl ScriptHost {
             (self.api.unload_assembly)(old.handle);
             (self.api.assembly_alive)(old.handle) == 0
         };
+        state(world).free_queries_of(old.handle);
 
         state(world).reloading = true;
         let loaded = self.load_raw(world, new_path);
@@ -592,6 +712,7 @@ impl ScriptHost {
             }
         };
 
+        self.remove_retired(world, old, &mut report);
         self.migrate_layouts(
             world,
             &old_registry,
@@ -612,9 +733,16 @@ impl ScriptHost {
                     .into(),
             );
         }
+        // Commands recorded by `OnAfterReload` callbacks.
+        world.flush_deferred();
         self.install(schedule, &new);
         Ok((new, report))
     }
+}
+
+/// The name a component had before it was retired.
+fn original_name(name: &str) -> String {
+    name.split(RETIRED_MARK).next().unwrap_or(name).to_owned()
 }
 
 /// A system implemented in C#: the schedule runs it like any other, and it
@@ -627,6 +755,8 @@ pub struct ScriptSystem {
     queue: delta::CommandQueue,
     last_run: Tick,
     access: Access,
+    /// Whether `access` was filled in from the first run's resource use.
+    access_known: bool,
 }
 
 impl System for ScriptSystem {
@@ -646,15 +776,42 @@ impl System for ScriptSystem {
 
     fn run(&mut self, world: &mut World) {
         let this_run = world.change_tick();
+        let at: *const World = world;
         {
             let st = state(world);
             st.current_queue = &raw mut self.queue;
             st.current_last_run = self.last_run;
+            st.current_owner = self.assembly;
+            if st.pinned_world.is_null() {
+                st.pinned_world = at;
+            }
         }
+        debug_assert!(
+            std::ptr::eq(state(world).pinned_world, world),
+            "the World moved while scripts hold pointers to it; keep it in a \
+             Box (see ScriptHost::start)"
+        );
+        state(world).touched.clear();
         // SAFETY: the script runtime resolved `run`; the world pointer stays
         // valid and exclusively ours for the call.
         unsafe { (self.run)(self.id, world) };
-        state(world).current_queue = std::ptr::null_mut();
+        if !self.access_known {
+            // Which resources a system uses is learned from its first run.
+            self.access_known = true;
+            let touched = std::mem::take(&mut state(world).touched);
+            for (id, write) in touched {
+                if let Some(ty) = world.exposed_resource_type(id) {
+                    if write {
+                        self.access.add_resource_write_id(ty);
+                    } else {
+                        self.access.add_resource_read_id(ty);
+                    }
+                }
+            }
+        }
+        let st = state(world);
+        st.current_queue = std::ptr::null_mut();
+        st.current_owner = bridge::NO_OWNER;
         self.last_run = this_run;
         world.increment_change_tick();
     }

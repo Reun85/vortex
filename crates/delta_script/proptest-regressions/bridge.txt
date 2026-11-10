@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a03bda0ec76aba17929a5fdaa4322af769967a5d15cc214c652711c52c38bc35 # shrinks to calls = [CmdRemove(0, 4)]
+cc 4f3bb04f9d6b9d0d7e535a5e99a2ffd35cc6d9be619211d2d5ce41f88a1562bc # shrinks to calls = [CmdInsert(0, 2, [0, 0, 0, 0, 0, 0, 0, 0])]

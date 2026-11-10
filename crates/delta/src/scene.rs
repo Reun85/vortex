@@ -20,8 +20,8 @@ use crate::{
     archetype::Archetype,
     component::ComponentId,
     entity::Entity,
-    hooks::DeferredWorld,
-    reflect::{FieldType, Reflect, TypeRegistry},
+    hooks::{DeferredWorld, HookContext},
+    reflect::{EnumRepr, FieldType, Reflect, TypeRegistry},
     world::World,
 };
 
@@ -101,7 +101,10 @@ pub struct LoadReport {
     pub warnings: Vec<String>,
 }
 
-const SCENE_VERSION: u64 = 1;
+/// The format written. Version 2 adds script (managed) components under
+/// `components`, keyed by class name; version 1 files still load.
+const SCENE_VERSION: u64 = 2;
+const OLDEST_SCENE_VERSION: u64 = 1;
 
 /// Scene entities that were despawned, by the handle they had and the
 /// [`SceneId`] they carried. Lets a reference that now dangles still be
@@ -112,7 +115,8 @@ pub(crate) struct Retired {
     pub(crate) by_id: HashMap<SceneId, Entity>,
 }
 
-fn scene_id_inserted(w: DeferredWorld<'_>, e: Entity) {
+fn scene_id_inserted(w: DeferredWorld<'_>, cx: HookContext) {
+    let e = cx.entity;
     let id = *w.get::<SceneId>(e).expect("hook runs with the component");
     w.world.scene_ids.insert(id, e);
     // The identity is alive again; it no longer dangles.
@@ -123,7 +127,8 @@ fn scene_id_inserted(w: DeferredWorld<'_>, e: Entity) {
     }
 }
 
-fn scene_id_replaced(w: DeferredWorld<'_>, e: Entity) {
+fn scene_id_replaced(w: DeferredWorld<'_>, cx: HookContext) {
+    let e = cx.entity;
     let id = *w.get::<SceneId>(e).expect("hook runs with the component");
     if w.world.scene_ids.get(&id) == Some(&e) {
         w.world.scene_ids.remove(&id);
@@ -191,6 +196,20 @@ impl World {
         self.get::<SceneId>(e).copied()
     }
 
+    /// The scene id a reference to `e` is saved as: its own, or the one it
+    /// had when it was despawned (while retired entities are tracked).
+    pub fn scene_id_for_reference(&self, e: Entity) -> Option<SceneId> {
+        self.scene_id_of(e)
+            .or_else(|| self.retired.as_ref()?.by_handle.get(&e).copied())
+    }
+
+    /// The entity a saved scene id refers to: the live one, or the
+    /// despawned handle it had (which then dangles until it is re-pointed).
+    pub fn entity_for_reference(&self, id: SceneId) -> Option<Entity> {
+        self.scene_entity(id)
+            .or_else(|| self.retired.as_ref()?.by_id.get(&id).copied())
+    }
+
     pub(crate) fn entity_ref_to_json(&self, e: Entity) -> Value {
         self.scene_id_of(e)
             .or_else(|| self.retired.as_ref()?.by_handle.get(&e).copied())
@@ -219,10 +238,17 @@ impl World {
         let mut components = Map::new();
         for (i, &c) in arch.components().iter().enumerate() {
             let info = self.components.info(c);
+            let ptr = arch.columns()[i].get_ptr(row);
+            if let Some(external) = &info.external {
+                components.insert(
+                    info.name.to_string(),
+                    (external.to_json)(self, ptr),
+                );
+                continue;
+            }
             let Some(reflect) = info.reflect else {
                 continue;
             };
-            let ptr = arch.columns()[i].get_ptr(row);
             let value = read_value(
                 &self.reflection,
                 &FieldType::Struct(reflect),
@@ -305,8 +331,9 @@ impl World {
         doc: &Value,
     ) -> Result<LoadReport, SceneError> {
         let format = |m: &str| SceneError::Format(m.to_owned());
-        if doc.get("version").and_then(Value::as_u64) != Some(SCENE_VERSION) {
-            return Err(format("unsupported or missing `version`"));
+        match doc.get("version").and_then(Value::as_u64) {
+            Some(v) if (OLDEST_SCENE_VERSION..=SCENE_VERSION).contains(&v) => {}
+            _ => return Err(format("unsupported or missing `version`")),
         }
         let list = doc
             .get("entities")
@@ -364,6 +391,7 @@ impl World {
         warnings: &mut Vec<String>,
     ) -> Result<(), SceneError> {
         let mut buffers: Vec<(ComponentId, ZeroedBuf)> = Vec::new();
+        let mut external: Vec<(ComponentId, OwnedValue)> = Vec::new();
         for (name, value) in components {
             let c = self.components.id_by_name(name).ok_or_else(|| {
                 SceneError::UnknownComponent {
@@ -372,6 +400,17 @@ impl World {
                 }
             })?;
             let info = self.components.info(c);
+            if let Some(ext) = info.external {
+                let owned =
+                    (ext.from_json)(self, c, value).map_err(|message| {
+                        SceneError::Field {
+                            component: name.clone(),
+                            message,
+                        }
+                    })?;
+                external.push((c, owned));
+                continue;
+            }
             let reflect = info.reflect.ok_or_else(|| {
                 SceneError::NotReflected { name: name.clone() }
             })?;
@@ -398,13 +437,68 @@ impl World {
         let items: Vec<(ComponentId, *const u8)> = buffers
             .iter()
             .map(|(c, b)| (*c, b.ptr.cast_const()))
+            .chain(external.iter().map(|(c, v)| (*c, v.as_ptr())))
             .collect();
         // SAFETY: each buffer holds a fully initialized value of its
         // component's layout (zeroed, then filled), the ids are distinct
-        // (JSON object keys), and reflected data has no drop glue.
+        // (JSON object keys), and reflected data has no drop glue; external
+        // values are handed over below and marked as inserted.
         unsafe { self.insert_many_by_id(entity, &items) }
             .expect("the entity was just spawned");
+        // The world owns the external values now.
+        for (_, owned) in external {
+            owned.inserted();
+        }
         Ok(())
+    }
+}
+
+/// A component value that is not yet in the world and owns what it holds
+/// (a script handle, say). Dropping it runs the component's drop function;
+/// call [`inserted`](Self::inserted) once the world took it over.
+pub struct OwnedValue {
+    buf: ZeroedBuf,
+    drop: Option<crate::blob_vec::DropFn>,
+    live: bool,
+}
+
+impl OwnedValue {
+    /// A zeroed value of `layout`. The drop function must accept zeroed
+    /// memory (script handles treat 0 as "nothing").
+    pub fn zeroed(
+        layout: Layout,
+        drop: Option<crate::blob_vec::DropFn>,
+    ) -> Self {
+        Self {
+            buf: ZeroedBuf::new(layout),
+            drop,
+            live: true,
+        }
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.buf.ptr
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.buf.ptr.cast_const()
+    }
+
+    /// The world now owns the contents; do not drop them here.
+    pub fn inserted(mut self) {
+        self.live = false;
+    }
+}
+
+impl Drop for OwnedValue {
+    fn drop(&mut self) {
+        if self.live
+            && let Some(drop) = self.drop
+        {
+            // SAFETY: the buffer holds a value of the component's layout
+            // that nobody else owns.
+            unsafe { drop(self.buf.ptr) };
+        }
     }
 }
 
@@ -477,7 +571,26 @@ pub(crate) fn read_value(
         };
     }
     match ty {
-        FieldType::Bool => scalar!(bool),
+        // A script (or any raw writer) may leave a byte other than 0 or 1;
+        // reading that as a `bool` would be undefined behaviour.
+        // SAFETY: as above.
+        FieldType::Bool => Value::from(unsafe { p.read_unaligned() } != 0),
+        FieldType::Enum { repr, variants } => {
+            // SAFETY: as above; the representation is a plain integer.
+            let raw = unsafe {
+                match repr {
+                    EnumRepr::U8 => u32::from(p.read_unaligned()),
+                    EnumRepr::U16 => {
+                        u32::from(p.cast::<u16>().read_unaligned())
+                    }
+                    EnumRepr::U32 => p.cast::<u32>().read_unaligned(),
+                }
+            };
+            match variants.iter().find(|(_, v)| *v == raw) {
+                Some((name, _)) => Value::from(&**name),
+                None => Value::from(raw),
+            }
+        }
         FieldType::I8 => scalar!(i8),
         FieldType::I16 => scalar!(i16),
         FieldType::I32 => scalar!(i32),
@@ -587,6 +700,45 @@ pub(crate) fn write_value(
                 .ok_or_else(|| format!("{path}: expected a bool"))?;
             // SAFETY: `dst` has room for this field.
             unsafe { dst.cast::<bool>().write_unaligned(b) };
+        }
+        FieldType::Enum { repr, variants } => {
+            let raw = match v {
+                Value::String(name) => variants
+                    .iter()
+                    .find(|(n, _)| **n == **name)
+                    .map(|(_, value)| *value)
+                    .ok_or_else(|| {
+                        let names: Vec<_> =
+                            variants.iter().map(|(n, _)| &**n).collect();
+                        format!(
+                            "{path}: `{name}` is not one of {}",
+                            names.join(", ")
+                        )
+                    })?,
+                _ => {
+                    v.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(
+                        || format!("{path}: expected a variant name or number"),
+                    )?
+                }
+            };
+            let fits = match repr {
+                EnumRepr::U8 => raw <= u32::from(u8::MAX),
+                EnumRepr::U16 => raw <= u32::from(u16::MAX),
+                EnumRepr::U32 => true,
+            };
+            if !fits {
+                return Err(format!("{path}: {raw} does not fit the enum"));
+            }
+            // SAFETY: `dst` has room for this field.
+            unsafe {
+                match repr {
+                    EnumRepr::U8 => dst.write(raw as u8),
+                    EnumRepr::U16 => {
+                        dst.cast::<u16>().write_unaligned(raw as u16);
+                    }
+                    EnumRepr::U32 => dst.cast::<u32>().write_unaligned(raw),
+                }
+            }
         }
         FieldType::I8 => int!(i8, as_i64),
         FieldType::I16 => int!(i16, as_i64),

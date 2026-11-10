@@ -7,7 +7,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <!-- Which "version" of the scripts to build: V1, V2 or V3. -->
+    <!-- Which "version" of the scripts to build: V1, V2, V3 or V4. -->
     <Variant Condition="'$(Variant)' == ''">V1</Variant>
     <DefineConstants>$(DefineConstants);$(Variant)</DefineConstants>
   </PropertyGroup>

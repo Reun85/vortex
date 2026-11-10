@@ -47,19 +47,98 @@ struct FieldAttrs {
     read_only: bool,
 }
 
-fn parse_type_name(input: &DeriveInput) -> syn::Result<Option<LitStr>> {
-    let mut name = None;
+struct TypeAttrs {
+    name: Option<LitStr>,
+    /// `#[reflect(script)]`: the engine generates a C# mirror.
+    script: bool,
+}
+
+fn parse_type_attrs(input: &DeriveInput) -> syn::Result<TypeAttrs> {
+    let mut out = TypeAttrs {
+        name: None,
+        script: false,
+    };
     for attr in input.attrs.iter().filter(|a| a.path().is_ident("reflect")) {
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("name") {
-                name = Some(meta.value()?.parse::<LitStr>()?);
+                out.name = Some(meta.value()?.parse::<LitStr>()?);
+                Ok(())
+            } else if meta.path.is_ident("script") {
+                out.script = true;
                 Ok(())
             } else {
                 Err(meta.error("unknown reflect attribute on a type"))
             }
         })?;
     }
-    Ok(name)
+    Ok(out)
+}
+
+/// The words inside the item's `#[repr(..)]` attributes.
+fn repr_words(input: &DeriveInput) -> Vec<String> {
+    let mut words = Vec::new();
+    for attr in input.attrs.iter().filter(|a| a.path().is_ident("repr")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if let Some(id) = meta.path.get_ident() {
+                words.push(id.to_string());
+            }
+            // `align(16)` and friends carry a value we do not need.
+            if meta.input.peek(syn::token::Paren) {
+                let content;
+                syn::parenthesized!(content in meta.input);
+                let _: TokenStream2 = content.parse()?;
+            }
+            Ok(())
+        });
+    }
+    words
+}
+
+/// A fieldless enum: stored as its `#[repr(u8/u16/u32)]` integer.
+fn expand_enum(
+    input: &DeriveInput,
+    data: &syn::DataEnum,
+) -> syn::Result<TokenStream2> {
+    let ident = &input.ident;
+    let words = repr_words(input);
+    let repr = if words.iter().any(|w| w == "u8") {
+        quote! { U8 }
+    } else if words.iter().any(|w| w == "u16") {
+        quote! { U16 }
+    } else if words.iter().any(|w| w == "u32") {
+        quote! { U32 }
+    } else {
+        return Err(syn::Error::new(
+            input.span(),
+            "a reflected enum needs #[repr(u8)], #[repr(u16)] or #[repr(u32)]",
+        ));
+    };
+    let mut variants = Vec::new();
+    for v in &data.variants {
+        if !matches!(v.fields, Fields::Unit) {
+            return Err(syn::Error::new(
+                v.span(),
+                "only fieldless enums can be reflected",
+            ));
+        }
+        let name = v.ident.to_string();
+        let var = &v.ident;
+        variants.push(quote! {
+            (::std::boxed::Box::<str>::from(#name), Self::#var as u32)
+        });
+    }
+    Ok(quote! {
+        impl ::delta::reflect::ReflectField for #ident {
+            fn field_type(
+                _: &mut ::delta::reflect::TypeRegistry,
+            ) -> ::delta::reflect::FieldType {
+                ::delta::reflect::FieldType::Enum {
+                    repr: ::delta::reflect::EnumRepr::#repr,
+                    variants: ::std::vec![ #(#variants),* ].into(),
+                }
+            }
+        }
+    })
 }
 
 fn parse_field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
@@ -95,16 +174,33 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             "Reflect cannot be derived for generic types",
         ));
     }
-    let Data::Struct(data) = &input.data else {
-        return Err(syn::Error::new(
-            input.span(),
-            "Reflect can only be derived for structs",
-        ));
+    let data = match &input.data {
+        Data::Struct(data) => data,
+        Data::Enum(data) => return expand_enum(input, data),
+        Data::Union(_) => {
+            return Err(syn::Error::new(
+                input.span(),
+                "Reflect can only be derived for structs and fieldless enums",
+            ));
+        }
     };
     let ident = &input.ident;
-    let name = match parse_type_name(input)? {
+    let attrs = parse_type_attrs(input)?;
+    let name = match &attrs.name {
         Some(lit) => quote! { #lit },
         None => quote! { concat!(module_path!(), "::", stringify!(#ident)) },
+    };
+    if attrs.script && !repr_words(input).iter().any(|w| w == "C") {
+        return Err(syn::Error::new(
+            input.span(),
+            "#[reflect(script)] needs #[repr(C)]: the C# mirror must \
+             reproduce the layout exactly",
+        ));
+    }
+    let mark_script = if attrs.script {
+        quote! { registry.mark_script(id); }
+    } else {
+        quote! {}
     };
 
     let mut field_exprs = Vec::new();
@@ -156,12 +252,14 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                     return id;
                 }
                 let fields = ::std::vec![ #(#field_exprs),* ];
-                registry.register::<Self>(
+                let id = registry.register::<Self>(
                     #name,
                     ::core::mem::size_of::<Self>(),
                     ::core::mem::align_of::<Self>(),
                     fields,
-                )
+                );
+                #mark_script
+                id
             }
         }
 

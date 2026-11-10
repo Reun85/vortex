@@ -8,6 +8,7 @@
 mod bridge;
 pub mod ffi;
 pub mod host;
+mod managed;
 mod script;
 
 pub use bridge::{PendingSystem, RemovedRecord};
